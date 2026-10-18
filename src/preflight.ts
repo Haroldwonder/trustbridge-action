@@ -265,13 +265,13 @@ export async function runHorizonHealthProbe(
   }
 }
 
-interface ProbeResult {
+export interface ProbeResult {
   ok: boolean;
   reason: string;
   status?: number;
 }
 
-async function probeHorizonUrl(
+export async function probeHorizonUrl(
   url: string,
   fetchImpl: typeof fetch,
   timeoutMs: number,

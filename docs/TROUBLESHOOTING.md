@@ -77,3 +77,45 @@ TrustBridge builds its Octokit client from `context.apiUrl` (backed by the runne
 
 **Helpful links:**
 - [USAGE: GitHub Projects v2 status updates](USAGE.md#github-projects-v2-status-updates-issue-222)
+
+## Local Horizon Reachability Check (`npm run horizon:check`)
+
+Operators can run a fast local probe to validate Horizon TLS and reachability matching the action's preflight logic before running workflows.
+
+### Basic usage
+
+```bash
+HORIZON_URL=https://horizon.stellar.org npm run horizon:check
+```
+
+### Environment variables & options
+
+| Variable / Option | Description |
+|-------------------|-------------|
+| `HORIZON_URL` (or `--url`, `-u`) | The Horizon URL endpoint to probe (required). Sensitive parts and account addresses in URLs are automatically redacted per logger policy. |
+| `HORIZON_TIMEOUT_MS` (or `--timeout`, `-t`) | Probe timeout in milliseconds (default: `5000`). |
+| `--verbose`, `-v` | Enable verbose output. |
+| `--help`, `-h` | Show help message. |
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Probe succeeded (HTTP response `< 400`). |
+| `1` | Probe failed (connection failure, timeout, or HTTP response `>= 400`). |
+| `2` | Invalid usage (missing URL or build output not found; run `npm run build` first). |
+
+### Examples
+
+```bash
+# Using environment variables
+HORIZON_URL=https://horizon.stellar.org HORIZON_TIMEOUT_MS=3000 npm run horizon:check
+
+# Using command-line arguments
+npm run horizon:check -- --url=https://horizon.stellar.org --timeout=3000 --verbose
+
+# Against local mock Horizon (from mock/horizon/docker-compose.yml)
+HORIZON_URL=http://localhost:8089 npm run horizon:check
+```
+
+The probe uses the same logic as the action's optional Horizon health probe (`horizon_probe: true`), including HEAD/GET fallback and timeout handling.
