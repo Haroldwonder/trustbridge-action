@@ -55,6 +55,7 @@ async function run(): Promise<void> {
   );
   const horizonUrlFallback = core.getInput('horizon_url_fallback') || '';
   const rpcFallbackUrlRaw = core.getInput('rpc_fallback_url') || '';
+  const allowCrossNetworkFallback = parseBooleanInput(core.getInput('allow_cross_network_fallback'), false);
   const fallbackUrls = rpcFallbackUrlRaw
     ? rpcFallbackUrlRaw.split(',').map((u) => u.trim()).filter(Boolean)
     : horizonUrlFallback
@@ -194,6 +195,7 @@ async function run(): Promise<void> {
     timeoutMs: horizonTimeoutMs,
     horizonUrlFallback: horizonUrlFallback || undefined,
     fallbackUrls,
+    allowCrossNetworkFallback,
     cacheTtlMs: useCache ? horizonCacheTtlMs : 0,
     useCache,
     rateBudgetTracker,
