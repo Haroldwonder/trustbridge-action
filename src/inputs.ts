@@ -16,6 +16,89 @@ export function parseBooleanInput(value: string, defaultValue: boolean): boolean
   return defaultValue;
 }
 
+/**
+ * Result of {@link resolveMaintainerSkipInput}, carrying the resolved value
+ * plus provenance so the action can emit a precise warning instead of
+ * guessing which input the user meant.
+ */
+export interface MaintainerSkipResolution {
+  /** Effective value used for the maintainer skip gate. */
+  enabled: boolean;
+  /** Which input supplied the effective value. */
+  source: 'skip_for_maintainers' | 'skip_if_maintainer' | 'default';
+  /** True when both inputs were supplied with conflicting boolean values. */
+  conflict: boolean;
+  /** True when the deprecated alias was used and the canonical input was not. */
+  usedDeprecatedAlias: boolean;
+}
+
+const TRUTHY = ['true', '1', 'yes'];
+const FALSY = ['false', '0', 'no'];
+
+/**
+ * Resolve the maintainer-skip input, honouring the canonical
+ * `skip_for_maintainers` name and the deprecated `skip_if_maintainer` alias
+ * (Issue #448).
+ *
+ * Precedence rules, in order:
+ *
+ * 1. `skip_for_maintainers` wins whenever it carries an explicit boolean.
+ *    A caller who writes `skip_for_maintainers: false` alongside a stale
+ *    `skip_if_maintainer: true` gets the explicit `false` — the canonical
+ *    input is never silently overridden.
+ * 2. The alias is consulted only when the canonical input is unset/empty.
+ *    This is what makes the alias usable at all: `action.yml` gives the
+ *    canonical input a `false` default, so "canonical is unset" is detected
+ *    from the raw (pre-default) input string rather than from the parsed
+ *    value.
+ * 3. If neither is supplied, the value is `false` (opt-in only).
+ *
+ * When both are supplied with conflicting values, `conflict` is set so the
+ * caller can warn; the canonical value is still the one used.
+ *
+ * @param canonicalValue Raw `skip_for_maintainers` input.
+ * @param aliasValue     Raw `skip_if_maintainer` input.
+ * @returns              Resolved value plus provenance.
+ */
+export function resolveMaintainerSkipInput(
+  canonicalValue: string | undefined,
+  aliasValue: string | undefined,
+): MaintainerSkipResolution {
+  const canonical = (canonicalValue ?? '').trim();
+  const alias = (aliasValue ?? '').trim();
+
+  const canonicalIsBoolean = TRUTHY.includes(canonical.toLowerCase())
+    || FALSY.includes(canonical.toLowerCase());
+  const aliasIsBoolean = TRUTHY.includes(alias.toLowerCase())
+    || FALSY.includes(alias.toLowerCase());
+
+  if (canonicalIsBoolean) {
+    const enabled = parseBooleanInput(canonical, false);
+    return {
+      enabled,
+      source: 'skip_for_maintainers',
+      conflict: aliasIsBoolean && parseBooleanInput(alias, false) !== enabled,
+      usedDeprecatedAlias: false,
+    };
+  }
+
+  if (aliasIsBoolean) {
+    return {
+      enabled: parseBooleanInput(alias, false),
+      source: 'skip_if_maintainer',
+      conflict: false,
+      usedDeprecatedAlias: true,
+    };
+  }
+
+  return {
+    enabled: false,
+    source: 'default',
+    conflict: false,
+    usedDeprecatedAlias: false,
+  };
+}
+
 export function parseNumberInput(
   value: string,
   defaultValue: number,
@@ -295,5 +378,64 @@ export function resolveGitHubAuthToken(options: GitHubAuthTokenOptions): string 
   throw new Error(
     'Missing GitHub authentication token. Please provide either `github_token` or `github_app_token`.',
   );
+}
+
+/** Raw (untrimmed) values for the ready-label input alias chains. */
+export interface ReadyLabelInputOptions {
+  passLabel?: string;
+  readyPassLabel?: string;
+  readyLabelPass?: string;
+  failLabel?: string;
+  readyFailLabel?: string;
+  readyLabelFail?: string;
+}
+
+export interface ResolvedReadyLabels {
+  passLabel: string;
+  failLabel: string;
+  /** True when either chain resolved from a deprecated alias. */
+  usedDeprecatedAlias: boolean;
+}
+
+/**
+ * Resolve the ready-state label pair from the documented alias chains.
+ *
+ * action.yml declares four deprecated aliases alongside the canonical
+ * `pass_label` / `fail_label`:
+ *
+ *   pass_label → ready_pass_label → ready_label_pass
+ *   fail_label → ready_fail_label → ready_label_fail
+ *
+ * Only the canonical names were read at runtime, so a workflow still using a
+ * deprecated name silently lost its label automation after upgrading instead
+ * of erroring. (Issue #669)
+ *
+ * A whitespace-only value counts as unset, matching `core.getInput` semantics
+ * where an omitted input yields ''. Trimming means a value such as
+ * `' wallet-ready '` resolves to `'wallet-ready'` rather than creating a
+ * differently-spaced label that GitHub would treat as distinct.
+ *
+ * Both chains resolve independently: a workflow may set a pass label through
+ * the canonical name and a fail label through a deprecated one.
+ */
+export function resolveReadyLabelInputs(
+  options: ReadyLabelInputOptions,
+): ResolvedReadyLabels {
+  const pick = (...candidates: Array<string | undefined>): { value: string; deprecated: boolean } => {
+    for (let i = 0; i < candidates.length; i += 1) {
+      const value = (candidates[i] ?? '').trim();
+      if (value) return { value, deprecated: i > 0 };
+    }
+    return { value: '', deprecated: false };
+  };
+
+  const pass = pick(options.passLabel, options.readyPassLabel, options.readyLabelPass);
+  const fail = pick(options.failLabel, options.readyFailLabel, options.readyLabelFail);
+
+  return {
+    passLabel: pass.value,
+    failLabel: fail.value,
+    usedDeprecatedAlias: pass.deprecated || fail.deprecated,
+  };
 }
 

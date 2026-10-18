@@ -122,7 +122,32 @@ When adding a new input to `action.yml`:
    - `description` (copy from `action.yml`)
    - `default` (must match `action.yml`)
    - Format/pattern constraints for URL, address, or numeric fields.
-3. Run `npm test` — the schema drift test will fail if any `action.yml` input is missing from the schema.
+3. Run `npm test` — the schema sync test will fail if any `action.yml` input is missing from the schema.
 4. Update `docs/SCHEMA.md` if the field has security implications.
 
 > The schema lives alongside the action rather than being auto-generated so that human-readable descriptions, examples, and security annotations can be maintained deliberately.
+
+---
+
+## Orphan detection and schema sync rules
+
+`__tests__/action-schema-sync.test.ts` enforces strict bidirectional sync between `action.yml` and `schemas/action-inputs.schema.json`. The test **fails CI** when any of these invariants is violated:
+
+| Invariant | What causes a failure |
+|-----------|----------------------|
+| **No missing inputs** | An `action.yml` input has no matching `properties` entry in the schema |
+| **No orphaned properties** | A schema `properties` entry has no matching `action.yml` input |
+| **Required alignment** | A `required: true` input in `action.yml` is absent from schema `required[]`, or vice-versa |
+| **Type consistency** | All schema properties must use `type: "string"` (GitHub Actions passes every input as a string at runtime) |
+| **Count parity** | The number of schema properties must equal the number of `action.yml` inputs |
+| **No ghost inputs** | Every `core.getInput('key')` call in `src/index.ts` must correspond to a declared `action.yml` input |
+
+### Fixing orphaned or missing inputs
+
+The **only** way to green the `action-schema-sync` test after a sync failure is to resolve the mismatch:
+
+- **Input in `action.yml` missing from schema** → add it to `schemas/action-inputs.schema.json` `properties`.
+- **Schema property not in `action.yml`** (orphan) → either add the input to `action.yml` or remove the property from the schema.
+- **`required[]` mismatch** → align `required: true/false` in `action.yml` with the `required[]` array in the schema.
+
+There is no suppression mechanism for sync failures — they must be fixed before a PR can merge.

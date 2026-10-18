@@ -86,7 +86,18 @@ describe('calculateBackoffDelay', () => {
 // ---------------------------------------------------------------------------
 
 describe('addJitter', () => {
+  let mathRandomSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    mathRandomSpy = jest.spyOn(Math, 'random');
+  });
+
+  afterEach(() => {
+    mathRandomSpy.mockRestore();
+  });
+
   it('returns a non-negative number close to the input', () => {
+    mathRandomSpy.mockRestore(); // use real random
     for (let i = 0; i < 20; i++) {
       const result = addJitter(1000);
       expect(result).toBeGreaterThanOrEqual(0);
@@ -96,6 +107,34 @@ describe('addJitter', () => {
 
   it('returns 0 when input is 0', () => {
     expect(addJitter(0)).toBe(0);
+  });
+
+  it('respects jitter percent bounds (min)', () => {
+    mathRandomSpy.mockReturnValue(0); // lowest possible random -> -jitter
+    expect(addJitter(1000, 10)).toBe(900);
+  });
+
+  it('respects jitter percent bounds (max)', () => {
+    mathRandomSpy.mockReturnValue(0.99999999); // highest possible random -> +jitter
+    const maxVal = addJitter(1000, 10);
+    expect(maxVal).toBeLessThanOrEqual(1100);
+    expect(maxVal).toBeGreaterThan(1099);
+  });
+
+  it('respects maxDelayMs cap', () => {
+    mathRandomSpy.mockReturnValue(1); // max positive jitter
+    // 1000 + 10% = 1100, capped at 1050
+    expect(addJitter(1000, 10, 1050)).toBe(1050);
+  });
+
+  it('does not exceed maxDelayMs even if jitter is large', () => {
+    mathRandomSpy.mockReturnValue(1);
+    expect(addJitter(30000, 10, 30000)).toBe(30000);
+  });
+
+  it('prevents negative delays', () => {
+    mathRandomSpy.mockReturnValue(0); // -jitter
+    expect(addJitter(10, 200)).toBe(0); // 10 - 20 = -10 -> 0
   });
 });
 
@@ -201,6 +240,20 @@ describe('retryWithBackoff', () => {
     await expect(promise).rejects.toThrow('non-retryable');
     expect(fn).toHaveBeenCalledTimes(1);
     expect(shouldRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it('identifies max-total-wait exhaustion separately from a rate-limit error', async () => {
+    const fn = jest.fn().mockRejectedValue(new Error('transient failure'));
+    const promise = retryWithBackoff(fn, {
+      ...DEFAULT_RETRY_POLICY,
+      maxRetries: 2,
+      initialDelayMs: 10,
+      maxDelayMs: 10,
+      maxTotalWaitMs: 5,
+    });
+
+    await expect(promise).rejects.toThrow(/Retry wait budget exhausted/);
+    expect(fn).toHaveBeenCalledTimes(1);
   });
 });
 

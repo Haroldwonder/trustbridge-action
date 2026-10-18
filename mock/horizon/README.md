@@ -46,6 +46,9 @@ The stubs in `mock/horizon/mappings/` cover the four most important scenarios:
 | `GCCC...CCCC` | `account-low-balance.json` | Funded, USDC trustline, but only 0.5 XLM |
 | `GDDD...DDDD` | `account-no-trustline.json` | Funded, 10 XLM, but no USDC trustline |
 | `GEEE...EEEE` | `rate-limited.json` | 429 Too Many Requests with `Retry-After: 1` |
+| `GFFF...FFFF` | `error-503.json` | 503 Service Unavailable |
+| `GGGG...GGGG` | `error-502.json` | 502 Bad Gateway |
+| `GHHH...HHHH` | `failover-scenario*.json` | 503 then 200 on retry (Failover) |
 | _(root)_ `/` | `health.json` | Horizon root metadata probe |
 
 Any address not matched by a stub returns WireMock's built-in 404 for
@@ -175,6 +178,47 @@ docker compose -f mock/horizon/docker-compose.yml restart
 - The mock is **intentionally not started in default CI** (`npm test`) to keep
   the standard test pipeline fast and dependency-free. Use `npm run test:mock`
   or the opt-in CI job for integration-level coverage.
+
+---
+
+## TLS pin fingerprint integration tests
+
+The file `__tests__/horizon-pin-integration.test.ts` contains integration
+tests for the `horizon_pin_fingerprint` input.  These tests spin up a
+local TLS server with a self-signed certificate (generated via `openssl`
+at test time) and validate that `checkCertificatePin` behaves correctly:
+
+| Scenario | Expected result |
+|---|---|
+| Fingerprint matches server cert | Probe succeeds (resolves) |
+| Fingerprint does not match | `HorizonPinMismatchError` thrown |
+| Empty fingerprint (`''`) | Probe is skipped, resolves immediately |
+| HTTP (non-HTTPS) URL | Probe is skipped regardless of fingerprint |
+
+### Running the TLS pin integration tests
+
+```bash
+# Run only the TLS pin integration tests
+npx jest --testPathPattern horizon-pin-integration
+```
+
+No external infrastructure is required — the tests generate their own
+self-signed certificate and start a local TLS server on a random port.
+The `openssl` CLI must be available (it is on all CI runners and
+developer machines).
+
+### How the fingerprint is computed
+
+The test connects to the local TLS server once during `beforeAll`,
+retrieves the peer certificate via `socket.getPeerCertificate().raw`,
+and computes the SHA-256 fingerprint:
+
+```
+SHA-256(raw_der_cert).toUpperCase().colon_separated
+```
+
+This matches the format produced by `checkCertificatePin` in
+`src/horizon.ts`.
 
 ---
 

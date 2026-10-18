@@ -21,13 +21,57 @@ Related docs: [README](../README.md) · [Architecture](ARCHITECTURE.md) · [Usag
 | Low XLM reserve | Horizon 200, native &lt; min | No | `xlm_balance` set, reserve fail | Posted with amount to send | per `fail_on_missing` |
 | Rate limited | Horizon 429 | Yes (≤3) | If exhausted: failure result | Posted if reachable | per `fail_on_missing` |
 | Service unavailable | Horizon 503/502/504 | Yes (≤3) | If exhausted: failure result | Posted | per `fail_on_missing` |
+| **Rate budget exhausted** | **`horizon_max_requests` exceeded** | **No (fail closed)** | **`reason_code: RATE_BUDGET_EXHAUSTED`, `xlm_balance=unknown`** | **Posted** | **per `fail_on_missing`** |
 | Timeout | AbortController 15s | Yes (≤3) | If exhausted: `xlm_balance=unknown` | Posted | per `fail_on_missing` |
 | TLS/certificate failure | Handshake/cert error connecting to `horizon_url` | No (not retryable — see below) | `xlm_balance=unknown`, distinct "Horizon TLS / certificate verification" check | Posted, attributes failure to the endpoint not the account | per `fail_on_missing` |
 | Unauthorized trustline | Horizon 200, trustline exists, `is_authorized: false` | No | Per `unauthorized_trustline_policy` — `fail` clears `trustline_exists` | Posted with issuer-authorization remediation/warning | per `fail_on_missing` (when policy is `fail`) |
 | Clawback-enabled trustline | Horizon 200, trustline exists, `is_clawback_enabled: true` | No | Warns by default; fails if `clawback_strict_mode: true` | Posted with clawback warning | per `fail_on_missing` (when strict mode is on) |
-| Unsafe `horizon_url`/`horizon_url_fallback`/`rpc_fallback_url` | SSRF-unsafe target or non-HTTPS scheme | No | Not set (run fails early) | Not posted | `setFailed` |
+| Unsafe `horizon_url`/`horizon_url_fallback`/`rpc_fallback_url`/`dashboard_roster_url` | SSRF-unsafe target or non-HTTPS scheme | No | Not set (run fails early) | Not posted | `setFailed` |
 | Comment API failure | GitHub 403/422/etc. | No | Still set from checks | Not posted | Check result still applies |
 | No issue context | workflow_dispatch without issue | No | Set normally | Skipped (warning) | per check result |
+
+---
+
+<!-- ERROR_CATALOG_BEGIN -->
+## Structured Error Catalog
+
+Machine-readable catalog of all `reason_code` values that TrustBridge sets on the `reason_code` output.
+This section is verified by `scripts/check-error-catalog.js` on every CI run — removing or renaming a
+code here will fail the build.
+
+| `reason_code` | Class / source | Retryable | Description |
+|---------------|---------------|-----------|-------------|
+| `SUCCESS` | `validAccountResult` · `src/checks.ts` | n/a | All checks passed: account funded, trustline present, XLM reserve met. |
+| `ACCOUNT_NOT_FUNDED` | `unfundedAccountResult` · `src/checks.ts` | Yes (with `wait_until_funded`) | Horizon returned 404 — the account has not been activated on-ledger yet. |
+| `TRUSTLINE_MISSING` | `validAccountResult` · `src/checks.ts` | No | Account is funded but does not hold the configured asset trustline. |
+| `RESERVE_TOO_LOW` | `validAccountResult` · `src/checks.ts` | No | Account is funded and has the trustline but native XLM balance is below the required reserve. |
+| `TRUSTLINE_LIMIT_TOO_LOW` | `validAccountResult` · `src/checks.ts` | No | Account has the trustline but its configured limit is below `min_trustline_limit`. |
+| `FAILED` | `validAccountResult` · `src/checks.ts` | No | Generic failure — one or more checks failed but no more-specific code applies. |
+| `HORIZON_ERROR` | `horizonFailureResult` · `src/checks.ts` | Yes (≤ 3 retries) | Horizon returned a non-404 HTTP error (502, 503, 504, etc.) or an unclassified failure. |
+| `HORIZON_TIMEOUT` | `horizonFailureResult` · `src/checks.ts` | Yes (≤ 3 retries) | Horizon request timed out (AbortController fired after `horizon_timeout_ms`). |
+| `TLS_ERROR` | `tlsFailureResult` · `src/checks.ts` | No | TLS handshake or certificate verification failed for `horizon_url`; connection was never established. |
+| `TRUSTLINE_UNAUTHORIZED` | `runAccountChecks` · `src/checks.ts` | No | Trustline exists but the issuer has not authorized it (`is_authorized: false`). Only emitted when `unauthorized_trustline_policy: fail`; under `warn` (default) or `ignore` the run does not fail on this. |
+| `CLAWBACK_BLOCKED` | `runAccountChecks` · `src/checks.ts` | No | The trustline has clawback enabled (`is_clawback_enabled: true`) and `clawback_strict_mode: true` blocked validation. The issuer can reclaim the held assets at any time. |
+| `CIRCUIT_OPEN` | `circuitOpenFailureResult` · `src/checks.ts` | Yes (after the breaker resets) | The Horizon circuit breaker tripped after repeated consecutive failures, so the run failed closed without issuing further requests. Distinct from `HORIZON_ERROR`: no request was attempted, so the account state is unknown. Resolve the underlying Horizon outage and re-run. |
+| `RATE_BUDGET_EXHAUSTED` | `rateBudgetExhaustedResult` · `src/checks.ts` | Yes (raise the budget) | The per-run Horizon request budget (`horizon_max_requests`) was exhausted before validation completed. The run fails closed by design rather than issuing unbounded requests. Distinct from `HORIZON_ERROR`: no request failed, the budget was deliberately consumed. Raise `horizon_max_requests` (most relevant in batch mode) or retry. |
+| `MILESTONE_GATE_SKIPPED` | milestone gate · `src/index.ts` | n/a (skip, not failure) | `milestone_allowlist` is active and the issue's milestone was absent or not in the allowlist, so validation was skipped before any Horizon request. No account state was determined. Set `milestone_fail_on_skip: true` to hard-fail instead of warn. |
+| `MAINTAINER_SKIPPED` | maintainer skip · `src/index.ts` | n/a (skip, not failure) | The actor matched CODEOWNERS or `maintainers_allowlist` and `skip_for_maintainers: true`, so checks were skipped. `ready` is `true` because nothing was found to be wrong. |
+| `CONTRACT_DESTINATION_OK` | C-address destination check · `src/index.ts` | n/a | The Soroban C-address payout destination was confirmed on-chain. Horizon account/trustline checks are intentionally skipped for contract destinations. |
+| `CONTRACT_NOT_FOUND` | C-address destination check · `src/index.ts` | No | The Soroban C-address payout destination was not found on the configured Soroban RPC. The contract must exist on-chain before it is eligible for payout. |
+| `RATE_LIMIT_EXHAUSTED` | `HorizonRateLimitError` · `src/horizon.ts` | No (budget exhausted) | Horizon returned HTTP 429 and all retry attempts were exhausted (or `retry_max_total_wait_ms` budget was exceeded). |
+| `PIN_MISMATCH` | `HorizonPinMismatchError` · `src/horizon.ts` | No | The Horizon TLS certificate fingerprint did not match `horizon_pin_fingerprint`. Not retried — a fingerprint mismatch means the certificate has changed or a MITM is present. Update `horizon_pin_fingerprint` or investigate the endpoint. (Issue #303) |
+
+### Notes
+
+- The `reason_code` output is always set, even when `fail_on_missing: false`.
+- Downstream steps can branch on `steps.<id>.outputs.reason_code` to implement custom logic per failure mode.
+- Codes in the `HORIZON_*` and `TLS_ERROR` family indicate infrastructure problems, not wallet configuration issues — contributors should not be asked to take action on these.
+- `RATE_LIMIT_EXHAUSTED` is distinct from `HORIZON_ERROR`: it specifically indicates the 429-retry budget was consumed, which may indicate high org-wide concurrency. Consider `rpc_fallback_url` or a self-hosted Horizon node.
+- `CIRCUIT_OPEN`, `RATE_BUDGET_EXHAUSTED`, and the `HORIZON_*` / `TLS_ERROR` family all report **infrastructure** conditions where the account state is genuinely *unknown* — not known-bad. Do not ask the wallet owner to fix their account in response to these; re-run once the endpoint or budget recovers.
+- `RATE_BUDGET_EXHAUSTED` is distinct from `RATE_LIMIT_EXHAUSTED`: the former is our own request budget (`horizon_max_requests`) being consumed, the latter is Horizon returning HTTP 429 after retries.
+- Skip codes (`MILESTONE_GATE_SKIPPED`, `MAINTAINER_SKIPPED`) mean no checks ran. They are not validation failures, and `ready` differs between them (`false` for the milestone gate, `true` for the maintainer skip). Branch on the code itself rather than assuming a skip implies failure.
+
+<!-- ERROR_CATALOG_END -->
 
 ---
 
@@ -85,12 +129,59 @@ Stellar accounts must receive a minimum XLM funding transaction before they exis
 
 Horizon may return `Retry-After`. The client:
 
-1. Waits for `Retry-After` or exponential backoff (1s, 2s, 4s)
+1. Waits for `Retry-After` or exponential backoff (1s, 2s, 4s) with a ±10% random jitter to prevent thundering herds.
 2. Enforces a sleep cap: `retry_max_delay_ms` (per retry) and `retry_max_total_wait_ms` (total across retries). If exceeded, throws a distinct rate limit error immediately.
 3. Retries up to **3** times
 4. If still failing → `horizonFailureResult`
 
-**Operator tip:** For high-volume orgs or mass assignments (Waves), consider configuring `horizon_max_requests` to cap the total requests per run. Once this budget is exhausted, the action will fail fast with a `RateBudgetExhaustedError` rather than stampeding the public Horizon API. Consider self-hosted Horizon or caching for extremely high concurrency workflows.
+**Operator tip:** For high-volume orgs or mass assignments (Waves), consider configuring `horizon_max_requests` to cap the total requests per run. Once this budget is exhausted, the action will fail fast with a `RATE_BUDGET_EXHAUSTED` reason code (distinct from `ACCOUNT_NOT_FUNDED` and `HORIZON_ERROR`) rather than stampeding the public Horizon API. Consider self-hosted Horizon or caching for extremely high concurrency workflows.
+
+---
+
+### `horizon_max_requests` — Rate budget exhausted (`RATE_BUDGET_EXHAUSTED`)
+
+When the `horizon_max_requests` input is set to a value greater than 0, TrustBridge tracks every real Horizon HTTP call (cache hits are not counted) via `RateBudgetTracker`. Once the budget is exceeded, the action **fails closed immediately** — it does not produce an "account not funded" comment that could mislead contributors.
+
+| Property | Value |
+|----------|-------|
+| `reason_code` | `RATE_BUDGET_EXHAUSTED` |
+| `accountFunded` | `false` |
+| `xlmBalance` | `unknown` |
+| `valid` | `false` |
+| Auto-unassign fires? | No — budget exhaustion is not treated as an account validity failure |
+
+**Why "fail closed" and not "unfunded"?**
+
+The account state is genuinely unknown when the budget is exhausted — no successful account lookup was made. Producing an `ACCOUNT_NOT_FUNDED` result (the 404 path) when we never confirmed the account's status would mislead contributors into sending XLM for an account that is already funded. `RATE_BUDGET_EXHAUSTED` makes the cause explicit so operators can tune the budget rather than contributors debugging a phantom "not funded" error.
+
+**Effect on `wait_until_funded` polling:**
+
+Budget exhaustion is **not** treated as "account not yet funded." The `waitForFundedAccount` polling loop only retries on Horizon 404 responses. Any other error — including `RateBudgetExhaustedError` — is rethrown immediately, stopping polling. This means:
+
+- Polling with `budget=1` stops after the first unfunded poll (the second attempt exceeds the budget before any network call).
+- The result reason_code is `RATE_BUDGET_EXHAUSTED`, not `ACCOUNT_NOT_FUNDED`.
+
+**Cache hits and the budget:**
+
+Cache hits (when `use_cache: true` and the TTL has not expired) bypass the `RateBudgetTracker` entirely. Only real HTTP requests to Horizon consume the budget. Setting `use_cache: true` with an appropriate `horizon_cache_ttl_ms` can significantly reduce budget consumption for matrix or high-frequency workflows.
+
+**Remediation:**
+
+- Increase `horizon_max_requests` to allow more requests per run.
+- Enable caching (`use_cache: true`) to reduce the number of real Horizon calls.
+- Reduce `wait_until_funded_timeout_ms` / `wait_until_funded_interval_ms` to limit polling retries.
+- Consider a self-hosted Horizon node for extremely high concurrency.
+
+**Example (enforce a 5-request cap):**
+
+```yaml
+with:
+  horizon_max_requests: 5
+  use_cache: true
+  horizon_cache_ttl_ms: 120000
+```
+
+If 5 requests are exhausted before the account check completes, the run fails with `RATE_BUDGET_EXHAUSTED` rather than making additional uncapped calls to the public Horizon API.
 
 ### 503 / 502 / 504 — Service degradation
 
@@ -100,6 +191,20 @@ Same retry policy as 429. Public Horizon occasionally returns 503 during mainten
 
 Default **15 seconds** per attempt. Network partitions or slow Horizon nodes trigger abort + retry.
 
+### Fetch stack (Node 20 / undici)
+
+TrustBridge uses Node.js 20's built-in `fetch` API (backed by `undici`) for Horizon requests,
+with `node-fetch` as a compatibility layer. This means:
+
+- Keep-alive connections are managed by undici's connection pool
+- Timeouts are enforced via `AbortController` — not socket-level SO_TIMEOUT
+- HTTP/2 multiplexing is not currently used; each request uses HTTP/1.1
+- Hung sockets: when `AbortController` fires, the underlying TCP socket
+  may remain in TIME_WAIT until the OS reclaims it, but no new requests
+  are dispatched
+- `ECONNRESET` from a dropped keep-alive connection is treated as a
+  retryable transport error (status 0)
+
 ### TLS / certificate verification failure
 
 Raised when the TLS handshake to `horizon_url` itself fails — expired certificate, self-signed certificate, hostname mismatch, or an untrusted CA. Not retried (retrying the same misconfigured endpoint cannot succeed) and, when a fallback URL is configured, the action falls through to it just like any other primary-endpoint failure.
@@ -108,9 +213,9 @@ Raised when the TLS handshake to `horizon_url` itself fails — expired certific
 
 **Common cause:** a private/enterprise Horizon mirror with a self-signed or internally-issued certificate that the Actions runner does not trust. See [Private Horizon mirrors](USAGE.md#private-horizon-mirrors) for setup guidance — TrustBridge never disables certificate verification to work around this.
 
-### Unsafe or non-HTTPS `horizon_url` / `horizon_url_fallback` / `rpc_fallback_url`
+### Unsafe or non-HTTPS `horizon_url` / `horizon_url_fallback` / `rpc_fallback_url` / `dashboard_roster_url`
 
-Rejected before any connection is attempted if the URL targets a private IP, loopback, link-local address, a cloud metadata endpoint, uses `file://`, or does not use `https://`. The run fails immediately (same as invalid input) — no Horizon call is ever made.
+Rejected before any connection is attempted if the URL targets a private IP, loopback, link-local address, a cloud metadata endpoint, uses `file://`, or does not use `https://` (unless `allowHttp` / `dashboard_roster_allow_http` is explicitly enabled). The run fails immediately (same as invalid input) — no Horizon/Dashboard call is ever made.
 
 ### Waiting for funding (`wait_until_funded`)
 

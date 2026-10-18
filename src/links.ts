@@ -1,3 +1,5 @@
+import { assertValidAssetCode, assertValidAssetIssuer, normalizeAssetCode } from './assets';
+
 /**
  * Stellar Laboratory and wallet deep-link helpers.
  *
@@ -53,6 +55,8 @@ export const FAQ_ANCHORS = {
   HORIZON_ERROR: 'horizon-error',
   DEBUG_MODE: 'debug-mode',
   WEBHOOK_NOT_RECEIVED: 'webhook-not-received',
+  CLAIMABLE_BALANCE: 'claimable-balance',
+  UNAUTHORIZED_TRUSTLINE: 'unauthorized-trustline',
 } as const;
 
 export type FaqAnchor = (typeof FAQ_ANCHORS)[keyof typeof FAQ_ANCHORS];
@@ -63,10 +67,13 @@ export type FaqAnchor = (typeof FAQ_ANCHORS)[keyof typeof FAQ_ANCHORS];
  */
 const CHECK_TO_ANCHOR_MAP: Array<{ keyword: string; anchor: FaqAnchor }> = [
   { keyword: 'funded', anchor: FAQ_ANCHORS.ACCOUNT_NOT_FUNDED },
+  // 'unauthorized' must come before 'trustline' so the more specific match wins
+  { keyword: 'unauthorized', anchor: FAQ_ANCHORS.UNAUTHORIZED_TRUSTLINE },
   { keyword: 'trustline', anchor: FAQ_ANCHORS.TRUSTLINE_MISSING },
   { keyword: 'reserve', anchor: FAQ_ANCHORS.XLM_RESERVE_TOO_LOW },
   { keyword: 'xlm', anchor: FAQ_ANCHORS.XLM_RESERVE_TOO_LOW },
   { keyword: 'horizon', anchor: FAQ_ANCHORS.HORIZON_ERROR },
+  { keyword: 'claimable', anchor: FAQ_ANCHORS.CLAIMABLE_BALANCE },
 ];
 
 /**
@@ -163,12 +170,22 @@ export function canonicalHorizonUrl(network: StellarNetwork): string {
     : 'https://horizon-testnet.stellar.org';
 }
 
-export function buildAccountViewerLink(stellarAddress: string, network: StellarNetwork): string {
+export function buildAccountViewerLink(
+  stellarAddress: string,
+  network: StellarNetwork,
+  dashboardUrl?: string,
+): string {
+  if (dashboardUrl && !isValidDashboardUrl(dashboardUrl)) {
+    throw new Error('Invalid dashboard URL');
+  }
   const params = new URLSearchParams({ network, account: stellarAddress });
   return `https://laboratory.stellar.org/#account-viewer?${params.toString()}`;
 }
 
-export function buildChangeTrustLink(network: StellarNetwork): string {
+export function buildChangeTrustLink(network: StellarNetwork, dashboardUrl?: string): string {
+  if (dashboardUrl && !isValidDashboardUrl(dashboardUrl)) {
+    throw new Error('Invalid dashboard URL');
+  }
   const params = new URLSearchParams({ network });
   return `https://laboratory.stellar.org/#txbuilder?${params.toString()}`;
 }
@@ -249,6 +266,26 @@ export function buildSep0007TxLink(options: Sep0007TxOptions): string {
   return `web+stellar:tx?${params.toString()}`;
 }
 
+function validateSep0007PayLinkOptions(options: Sep0007PayOptions): void {
+  const assetCode = options.assetCode?.trim();
+  const assetIssuer = options.assetIssuer?.trim();
+
+  if (assetCode || assetIssuer) {
+    if (!assetCode) {
+      throw new Error('assetCode is required when assetIssuer is provided.');
+    }
+    if (!assetIssuer) {
+      throw new Error('assetIssuer is required when assetCode is provided.');
+    }
+    assertValidAssetCode(assetCode);
+    assertValidAssetIssuer(assetIssuer);
+  }
+
+  if (options.networkPassphrase !== undefined && !options.networkPassphrase.trim()) {
+    throw new Error('networkPassphrase must be a non-empty string when provided.');
+  }
+}
+
 /**
  * Options for building a SEP-0007 `pay` deep link.
  */
@@ -293,6 +330,8 @@ export interface Sep0007PayOptions {
  * ```
  */
 export function buildSep0007PayLink(options: Sep0007PayOptions): string {
+  validateSep0007PayLinkOptions(options);
+
   const network = options.network ?? 'public';
   const passphrase =
     options.networkPassphrase ??
@@ -308,9 +347,9 @@ export function buildSep0007PayLink(options: Sep0007PayOptions): string {
     params.set('amount', options.amount);
   }
   if (options.assetCode) {
-    params.set('asset_code', options.assetCode);
+    params.set('asset_code', normalizeAssetCode(options.assetCode));
     if (options.assetIssuer) {
-      params.set('asset_issuer', options.assetIssuer);
+      params.set('asset_issuer', options.assetIssuer.trim());
     }
   }
   if (options.memo) {

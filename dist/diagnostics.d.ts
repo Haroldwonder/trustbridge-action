@@ -56,6 +56,20 @@ export interface DiagnosticsConfig {
     runInfo?: DiagnosticsRunInfo;
     /** Whether to include the full normalized-inputs table (default true). */
     showInputs?: boolean;
+    /** Optional sponsorship info for chain analysis. */
+    sponsorshipInfo?: {
+        numSponsoring: number;
+        numSponsored: number;
+    };
+    /** Optional reserve requirement for sponsorship breakdown. */
+    reserveRequirement?: {
+        protocolMinimum: number;
+        configuredFloor: number;
+        required: number;
+        actual: number;
+        met: boolean;
+        subentryCount: number;
+    };
 }
 /**
  * Build a redacted, safe-to-log copy of the inputs snapshot.
@@ -72,4 +86,32 @@ declare const DIAGNOSTICS_CLOSE_MARKER = "<!-- trustbridge-action:diagnostics-en
  * content, so callers can append unconditionally.
  */
 export declare function buildDiagnosticsBlock(config: DiagnosticsConfig): string;
+export interface SponsorshipDiagnostics {
+    numSponsoring: number;
+    numSponsored: number;
+    subentryCount: number;
+    netSponsorshipEffect: number;
+    protocolMinimum: number;
+    configuredFloor: number;
+    finalRequired: number;
+    actualBalance: number;
+    meetsRequirement: boolean;
+}
+/**
+ * Build a sponsorship-specific diagnostics section for accounts with
+ * non-zero sponsorship counts. This provides visibility into how nested
+ * sponsorship chains affect reserve requirements without modifying the
+ * contributor-facing sections.
+ */
+export declare function buildSponsorshipDiagnostics(sponsorshipInfo?: {
+    numSponsoring: number;
+    numSponsored: number;
+}, reserveRequirement?: {
+    protocolMinimum: number;
+    configuredFloor: number;
+    required: number;
+    actual: number;
+    met: boolean;
+    subentryCount: number;
+}): string;
 export { DIAGNOSTICS_OPEN_MARKER, DIAGNOSTICS_CLOSE_MARKER };

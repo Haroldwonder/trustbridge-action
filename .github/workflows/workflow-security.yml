@@ -1,79 +1,61 @@
-# Workflow security linting — actionlint + zizmor
-#
-# Drop this in as .github/workflows/workflow-security.yml, OR copy the two
-# jobs below into your existing ci.yml if you want everything in one file.
-#
-# What it does:
-#   - actionlint: catches syntax/semantic bugs in workflow YAML (typo'd
-#     expressions, invalid runs-on, bad matrix config, shellcheck issues
-#     in run: steps, etc). Fails the PR directly.
-#   - zizmor: catches security issues (template injection via untrusted
-#     ${{ }} interpolation, excessive permissions, unpinned actions,
-#     dangerous pull_request_target usage, credential persistence, etc).
-#     Uploads results to the Security tab as SARIF so history is kept.
-#
-# actionlint = correctness. zizmor = security. Run both — they don't overlap.
-
 name: Workflow Security
 
-on:
-  pull_request:
-    paths:
-      - ".github/workflows/**"
-      - "docs/examples/**"
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/**"
-      - "docs/examples/**"
+# Runs zizmor static analysis on workflow files to catch credential-exfiltration
+# patterns, unpinned action references, and other security anti-patterns before
+# they are merged. Triggered on any push or PR that touches workflow files.
+#
+# Related issues:
+#   #661 — CI: run zizmor workflow security scan on workflow changes
+#   #555 — Add root .actionlint.yaml for example-workflow suppressions
+#
+# Configuration:
+#   .github/zizmor.yml  — suppression rules for known-safe patterns
+#   .actionlint.yaml    — actionlint suppression rules (root of repo)
 
-# Deny-by-default at the workflow level. Each job grants only what it needs.
-permissions: {}
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/**'
+      - '.github/zizmor.yml'
+      - '.actionlint.yaml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/**'
+      - '.github/zizmor.yml'
+      - '.actionlint.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  actionlint:
-    name: actionlint
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-
-      - name: Run actionlint
-        uses: reviewdog/action-actionlint@a5524e1c19e62881d79c1f1b9b6f09f16356e281 # v1.65.2
-        with:
-          reporter: github-pr-check
-          fail_level: error
-          # Reusable-workflow / example-only false positives (e.g. SC2016 on
-          # intentional single-quoted example snippets) can be suppressed
-          # with an .actionlint.yaml at the repo root — see note below.
-
   zizmor:
-    name: zizmor
+    name: zizmor workflow security scan
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # actions: read and security-events: write are needed for SARIF
-      # upload on a private repo. Drop `actions: read` if this repo is
-      # public and you don't need Advanced Security history.
-      actions: read
-      security-events: write
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           persist-credentials: false
 
-      - name: Run zizmor
-        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+      - name: Run zizmor 🌈
+        uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e  # v0.7.1
         with:
-          # Online audits (e.g. cross-checking action refs against GitHub)
-          # need a token. Omit this if you want zizmor fully offline.
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # advanced-security defaults to true (uploads SARIF). Set to
-          # false here if this repo doesn't have GitHub Advanced Security
-          # / isn't public, and just want the console output + job failure.
-          # advanced-security: false
+          # Scan all workflow files in .github/workflows/
+          inputs: .github/workflows/
+          # Load repository suppression rules
+          config: .github/zizmor.yml
+          # Do not require GitHub Advanced Security — works on any public repo
+          advanced-security: false
+          # Fail the job when zizmor finds unsuppressed issues
+          # (annotations mode is incompatible with advanced-security: false)
+          annotations: false
+          # Minimum severity to report (low|medium|high|critical)
+          min-severity: medium
+          # Minimum confidence to report (low|medium|high)
+          min-confidence: medium

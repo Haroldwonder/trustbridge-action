@@ -49,7 +49,13 @@ export class PluginLoadError extends Error {
   constructor(
     message: string,
     public readonly pluginPath: string,
-    public readonly reason: 'path_traversal' | 'not_found' | 'not_file' | 'invalid_export' | 'load_failed',
+    public readonly reason:
+      | 'path_traversal'
+      | 'not_found'
+      | 'not_file'
+      | 'invalid_export'
+      | 'load_failed'
+      | 'duplicate_id',
   ) {
     super(message);
     this.name = 'PluginLoadError';
@@ -106,7 +112,7 @@ export async function loadPlugin(
   const pathValidation = validatePluginPath(workspaceRoot, pluginPath);
   if (!pathValidation.valid) {
     throw new PluginLoadError(
-      `Plugin path validation failed: ${pathValidation.reason}`,
+      `Plugin path validation failed: ${'reason' in pathValidation ? pathValidation.reason : 'invalid path'}`,
       pluginPath,
       'path_traversal',
     );
@@ -222,6 +228,8 @@ function isCheckPlugin(obj: unknown): obj is CheckPlugin {
  *
  * Only paths listed in `allowedPluginPaths` are loaded. Missing or invalid
  * plugins are logged as warnings but do not block the run (fail-open).
+ * Two plugins exporting the same `id` throw a `PluginLoadError` with reason
+ * `duplicate_id`.
  *
  * Returns an array of successfully loaded plugins.
  */
@@ -245,18 +253,33 @@ export async function loadPluginsFromAllowlist(
   }
 
   const loaded: CheckPlugin[] = [];
+  const pathById = new Map<string, string>();
 
   for (const pluginPath of allowedPluginPaths) {
+    let plugin: CheckPlugin;
     try {
-      const plugin = await loadPlugin(workspaceRoot, pluginPath, { debugMode });
-      loaded.push(plugin);
+      plugin = await loadPlugin(workspaceRoot, pluginPath, { debugMode });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logger.warn(`Failed to load plugin from ${pluginPath}: ${message}`, {
         component: 'pluginLoader',
       });
       // Fail-open: continue loading other plugins
+      continue;
     }
+
+    // Duplicate ids are a configuration error: the registry is first-wins, so
+    // one plugin would be silently dropped. Fail with a clear error instead.
+    const existingPath = pathById.get(plugin.id);
+    if (existingPath !== undefined) {
+      throw new PluginLoadError(
+        `Duplicate plugin id "${plugin.id}": ${pluginPath} exports the same id as ${existingPath}. Plugin ids must be unique.`,
+        pluginPath,
+        'duplicate_id',
+      );
+    }
+    pathById.set(plugin.id, pluginPath);
+    loaded.push(plugin);
   }
 
   if (debugMode) {

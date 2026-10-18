@@ -1,11 +1,13 @@
 /**
  * Tests for Issue #34 — structured JSON logging of action inputs.
+ * Tests for Issue #460 — Redact muxed M-addresses in logs.
  *
  * Covers:
  *   - buildInputsLogRecord: address/URL redaction per field
  *   - emitInputsLogRecord: calls core.info with the JSON artifact
  *   - StructuredLogger redaction helpers (redactStellarAddress, redactHorizonUrl,
  *     redactString) used internally by buildInputsLogRecord
+ *   - Muxed M-address (69-char) redaction in all redaction paths (Issue #460)
  */
 
 import * as core from '@actions/core';
@@ -26,6 +28,13 @@ jest.mock('@actions/core');
 const VALID_G_ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const VALID_C_ADDRESS = 'C' + 'A'.repeat(55);
 const HORIZON_URL = 'https://horizon.stellar.org';
+
+/**
+ * A syntactically valid 69-char muxed M-address shape used for redaction
+ * tests. Note: this is not a checksum-valid StrKey — it is used only to
+ * verify that the logger regex correctly identifies and redacts the shape.
+ */
+const VALID_M_ADDRESS = 'M' + 'A'.repeat(68);
 
 /** Build a minimal valid ActionInputsLogRecord with sensible defaults. */
 function makeInputs(overrides: Partial<ActionInputsLogRecord> = {}): ActionInputsLogRecord {
@@ -66,6 +75,16 @@ describe('redactStellarAddress', () => {
     expect(redactStellarAddress(VALID_C_ADDRESS)).toBe('CAAA...AAAA');
   });
 
+  it('masks a muxed M-address (69 chars) to first-4…last-4', () => {
+    expect(redactStellarAddress(VALID_M_ADDRESS)).toBe('MAAA...AAAA');
+  });
+
+  it('does not mask a short M-prefix string that is not a real M-address', () => {
+    // Only 10 chars starting with M — not an address shape
+    const notAddr = 'MSHORTADDR';
+    expect(redactStellarAddress(notAddr)).toBe(notAddr);
+  });
+
   it('returns non-address strings unchanged', () => {
     expect(redactStellarAddress('not-an-address')).toBe('not-an-address');
   });
@@ -74,10 +93,8 @@ describe('redactStellarAddress', () => {
     expect(redactStellarAddress('')).toBe('');
   });
 
-  it('trims before validating — a padded valid address is still redacted', () => {
+  it('trims before validating — a padded valid G-address is still redacted', () => {
     const padded = `  ${VALID_G_ADDRESS}  `;
-    // The function trims internally; the trimmed content is 56 chars and
-    // passes the address check, so the return value is the redacted form.
     expect(redactStellarAddress(padded)).toBe('GAAA...AWHF');
   });
 });
@@ -98,6 +115,13 @@ describe('redactHorizonUrl', () => {
     expect(result).toContain('GAAA...AWHF');
   });
 
+  it('masks an embedded muxed M-address (69 chars) in the account path (Issue #460)', () => {
+    const url = `${HORIZON_URL}/accounts/${VALID_M_ADDRESS}`;
+    const result = redactHorizonUrl(url);
+    expect(result).not.toContain(VALID_M_ADDRESS);
+    expect(result).toContain('MAAA...AAAA');
+  });
+
   it('returns empty string unchanged', () => {
     expect(redactHorizonUrl('')).toBe('');
   });
@@ -114,14 +138,24 @@ describe('redactString', () => {
     expect(result).toContain('GAAA...AWHF');
   });
 
-  it('masks muxed M-addresses and webhook secrets in a free-form string', () => {
-    const muxed = 'M' + 'A'.repeat(55);
+  it('masks real muxed M-addresses (69-char shape) and webhook secrets in a free-form string (Issue #460)', () => {
+    const muxed = VALID_M_ADDRESS; // 69-char M-address
     const msg = `account=${muxed}; webhook_secret=supersecret-123; X-TrustBridge-Signature: sha256=abc123def456`;
     const result = redactString(msg);
     expect(result).not.toContain(muxed);
     expect(result).not.toContain('supersecret-123');
     expect(result).not.toContain('abc123def456');
     expect(result).toContain('MAAA...AAAA');
+  });
+
+  it('masks multiple muxed M-addresses in the same string (Issue #460)', () => {
+    const addr2 = 'M' + 'B'.repeat(68);
+    const msg = `from=${VALID_M_ADDRESS} to=${addr2}`;
+    const result = redactString(msg);
+    expect(result).not.toContain(VALID_M_ADDRESS);
+    expect(result).not.toContain(addr2);
+    expect(result).toContain('MAAA...AAAA');
+    expect(result).toContain('MBBB...BBBB');
   });
 
   it('leaves a string with no address unchanged', () => {
@@ -134,6 +168,75 @@ describe('redactString', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Issue #460 — Muxed M-address redaction in all log output paths
+// ---------------------------------------------------------------------------
+
+describe('Issue #460 — Muxed M-address redaction', () => {
+  beforeEach(() => {
+    logger.setDebugMode(false);
+    jest.clearAllMocks();
+  });
+
+  it('redactStellarAddress handles a 69-char M-address', () => {
+    expect(redactStellarAddress(VALID_M_ADDRESS)).toBe('MAAA...AAAA');
+  });
+
+  it('redactString masks a 69-char M-address embedded in free-form text', () => {
+    const msg = `muxed account ${VALID_M_ADDRESS} processed`;
+    expect(redactString(msg)).not.toContain(VALID_M_ADDRESS);
+    expect(redactString(msg)).toContain('MAAA...AAAA');
+  });
+
+  it('redactHorizonUrl masks a 69-char M-address in an /accounts/ path', () => {
+    const url = `https://horizon.stellar.org/accounts/${VALID_M_ADDRESS}`;
+    const result = redactHorizonUrl(url);
+    expect(result).not.toContain(VALID_M_ADDRESS);
+    expect(result).toContain('MAAA...AAAA');
+  });
+
+  it('logger.info does not leak muxed M-addresses in info output', () => {
+    const infoSpy = core.info as jest.MockedFunction<typeof core.info>;
+    logger.info(`Payment routing: muxed=${VALID_M_ADDRESS}`, { component: 'payment' });
+    const [message] = infoSpy.mock.calls[0];
+    expect(message).not.toContain(VALID_M_ADDRESS);
+    expect(message).toContain('MAAA...AAAA');
+  });
+
+  it('logger.warn does not leak muxed M-addresses in warn output', () => {
+    const warnSpy = core.warning as jest.MockedFunction<typeof core.warning>;
+    logger.warn(`Muxed address used: ${VALID_M_ADDRESS}`);
+    const [message] = warnSpy.mock.calls[0];
+    expect(message).not.toContain(VALID_M_ADDRESS);
+    expect(message).toContain('MAAA...AAAA');
+  });
+
+  it('logger.debug does not leak muxed M-addresses in debug output', () => {
+    const debugSpy = core.debug as jest.MockedFunction<typeof core.debug>;
+    logger.setDebugMode(true);
+    logger.debug(`Fetching muxed account ${VALID_M_ADDRESS}`, { component: 'horizon' });
+    const [message] = debugSpy.mock.calls[0];
+    expect(message).not.toContain(VALID_M_ADDRESS);
+    expect(message).toContain('MAAA...AAAA');
+  });
+
+  it('redactContext masks a muxed M-address in a stellarAddress context key', () => {
+    const ctx = { component: 'test', stellarAddress: VALID_M_ADDRESS };
+    const safe = redactContext(ctx);
+    expect(safe?.stellarAddress).not.toContain(VALID_M_ADDRESS);
+    expect(safe?.stellarAddress).toBe('MAAA...AAAA');
+  });
+
+  it('does not double-redact when G-address and M-address both appear', () => {
+    const msg = `g=${VALID_G_ADDRESS} m=${VALID_M_ADDRESS}`;
+    const result = redactString(msg);
+    expect(result).not.toContain(VALID_G_ADDRESS);
+    expect(result).not.toContain(VALID_M_ADDRESS);
+    expect(result).toContain('GAAA...AWHF');
+    expect(result).toContain('MAAA...AAAA');
+  });
+});
+
 describe('logger redaction in output paths', () => {
   beforeEach(() => {
     logger.setDebugMode(false);
@@ -141,7 +244,7 @@ describe('logger redaction in output paths', () => {
   });
 
   it('redacts muxed addresses and webhook secret values from debug output', () => {
-    const muxed = 'M' + 'A'.repeat(55);
+    const muxed = VALID_M_ADDRESS; // real 69-char M-address
     const debugSpy = core.debug as jest.MockedFunction<typeof core.debug>;
     logger.setDebugMode(true);
     logger.debug('Debug call with account data', {
@@ -257,7 +360,7 @@ describe('buildInputsLogRecord', () => {
   });
 
   it('returns a plain JSON-serialisable object (no circular refs, no undefined)', () => {
-    const record = buildInputsLogRecord(makeInputs());
+    const record = buildInputsLogRecord(makeInputs({ maxRetries: 3, retryBaseDelayMs: 1000 }));
     expect(() => JSON.stringify(record)).not.toThrow();
     const parsed = JSON.parse(JSON.stringify(record));
     // Every key that exists in the record must survive the JSON round-trip

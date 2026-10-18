@@ -143,8 +143,9 @@ describe('detectNetworkMismatch', () => {
     const hint = await detectNetworkMismatch(MAINNET_HORIZON, VALID_ADDRESS, fetch);
     expect(hint).toBeDefined();
     const detail = buildNetworkMismatchDetail(VALID_ADDRESS, hint!);
-    expect(detail).toContain('public');
-    expect(detail).toContain('testnet');
+    expect(detail).toContain('Network mismatch detected');
+    expect(detail).toContain('Configured network:');
+    expect(detail).toContain('Active network:');
     expect(detail).toContain(MAINNET_HORIZON);
     expect(detail).toContain(TESTNET_HORIZON);
     expect(detail).toContain('horizon_url');
@@ -155,8 +156,9 @@ describe('detectNetworkMismatch', () => {
     const hint = await detectNetworkMismatch(TESTNET_HORIZON, VALID_ADDRESS, fetch);
     expect(hint).toBeDefined();
     const detail = buildNetworkMismatchDetail(VALID_ADDRESS, hint!);
-    expect(detail).toContain('testnet');
-    expect(detail).toContain('public');
+    expect(detail).toContain('Network mismatch detected');
+    expect(detail).toContain('Configured network:');
+    expect(detail).toContain('Active network:');
     expect(detail).toContain(MAINNET_HORIZON);
     expect(detail).toContain(TESTNET_HORIZON);
   });
@@ -183,18 +185,19 @@ describe('detectNetworkMismatch', () => {
     expect(result.checks[0].detail).toContain('not found');
   });
 
-  it('SSRF guard: invalid alt URL would return undefined without fetch', async () => {
-    // Canonical URLs are always valid, but we test the guard by ensuring fetch is not called
-    // when we manually block via validation logic — indirectly tested via canonical validity.
-    // Here we verify that a timeout still returns undefined (defensive)
-    const slowFetch = async (): Promise<{ status: number }> => {
-      await new Promise((r) => setTimeout(r, 6000));
-      return { status: 200 };
-    };
-    // With AbortSignal.timeout(5000), a slow fetch should timeout and return undefined
-    const hint = await detectNetworkMismatch(MAINNET_HORIZON, VALID_ADDRESS, slowFetch);
-    // Either undefined or hint depending on timing; ensure no throw
-    expect(hint === undefined || hint !== undefined).toBe(true);
+  it('returns undefined when the opposite-network fetch fails', async () => {
+    const fetchMock = jest.fn(async () => {
+      throw new Error('The operation was aborted');
+    });
+
+    const hint = await detectNetworkMismatch(
+      MAINNET_HORIZON,
+      VALID_ADDRESS,
+      fetchMock,
+    );
+
+    expect(hint).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -213,15 +216,21 @@ describe('unfundedAccountResult with NetworkMismatchHint', () => {
     const fundedCheck = result.checks.find((c) => c.label === 'Account funded');
     expect(fundedCheck).toBeDefined();
     expect(fundedCheck!.passed).toBe(false);
-    expect(fundedCheck!.detail).toContain('network mismatch');
-    expect(fundedCheck!.detail).toContain('public');
-    expect(fundedCheck!.detail).toContain('testnet');
+    expect(fundedCheck!.detail).toContain('Network mismatch detected');
+    expect(fundedCheck!.detail).toContain('Configured network:');
+    expect(fundedCheck!.detail).toContain('Active network:');
+    expect(fundedCheck!.detail).toContain(MAINNET_HORIZON);
+    expect(fundedCheck!.detail).toContain(TESTNET_HORIZON);
   });
 
-  it('includes remediation that mentions switching horizon_url', () => {
+  it('includes remediation that names both network URLs', () => {
     const result = unfundedAccountResult(VALID_ADDRESS, MOCK_CONFIG, mismatchHint);
+    expect(result.remediation).toContain('Network mismatch detected');
+    expect(result.remediation).toContain('Configured network:');
+    expect(result.remediation).toContain('Active network:');
+    expect(result.remediation).toContain(MAINNET_HORIZON);
+    expect(result.remediation).toContain(TESTNET_HORIZON);
     expect(result.remediation).toContain('horizon_url');
-    expect(result.remediation).toContain('testnet');
   });
 
   it('does NOT include mismatch text when no hint is provided', () => {

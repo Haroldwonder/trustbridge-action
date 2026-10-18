@@ -4,15 +4,13 @@
   "description": "GitHub Action to verify Stellar account trustlines and XLM reserve before issue assignment workflows",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc --noEmit && ncc build src/index.ts -o dist --source-map --license licenses.txt && node scripts/normalize-maps.js",
-    "bundle-size": "npm test -- --testPathPattern bundle-size --no-coverage",
+    "build": "tsc --noEmit && ncc build src/index.ts -o dist --source-map --license licenses.txt",
+    "typecheck": "tsc --noEmit",
     "test": "jest",
     "test:coverage": "jest --coverage",
-    "test:mock": "jest --testPathPattern horizon-mock-smoke --forceExit",
     "lint": "eslint src __tests__ --ext .ts",
-    "prepare": "npm run build",
-    "mock:start": "docker compose -f mock/horizon/docker-compose.yml up -d --wait",
-    "mock:stop": "docker compose -f mock/horizon/docker-compose.yml down"
+    "license:check": "node scripts/check-licenses.js",
+    "prepare": "npm run build"
   },
   "repository": {
     "type": "git",
@@ -41,7 +39,6 @@
     "@vercel/ncc": "^0.38.3",
     "eslint": "^9.17.0",
     "jest": "^29.7.0",
-    "license-checker": "^25.0.1",
     "ts-jest": "^29.2.5",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.18.0"

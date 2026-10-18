@@ -1,5 +1,5 @@
 {
-  "id": "no-trustline-account",
+  "id": "b6d6f9b2-4f9d-4d70-ae4d-9cbf00fbb507",
   "name": "GET /accounts/{address} — funded account with sufficient XLM but no USDC trustline",
   "request": {
     "method": "GET",
