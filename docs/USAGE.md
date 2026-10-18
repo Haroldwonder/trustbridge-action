@@ -929,6 +929,10 @@ with:
 
 Use this when contributors are expected to fund their wallet right after assignment. The action polls `GET /accounts/{id}` every `wait_until_funded_interval_ms` until it stops 404ing or `wait_until_funded_timeout_ms` elapses, then proceeds exactly as it would for a single check (comment, outputs, `fail_on_missing`). Non-404 Horizon errors (rate limits, outages, timeouts) are not retried by the polling loop — the existing per-request retry/backoff in `horizon.ts` handles those, and if they're still failing after that, the run fails fast instead of continuing to poll.
 
+### Cancellation behavior
+
+If the GitHub Actions job is cancelled (or the workflow is stopped) while `wait_until_funded` is polling, the action will **immediately exit the polling loop** rather than waiting for the current poll interval to complete. This is implemented by honoring the job's `AbortSignal` during the sleep between polls. The run logs will show `Funding poll stopped due to cancellation` and the action will fail with `reason_code: HORIZON_ERROR` (or `FUNDING_POLL_CANCELLED` if configured), not `ACCOUNT_NOT_FUNDED`. This prevents wasted runner minutes after a user aborts the workflow.
+
 ## Action outputs
 
 ### `comment_url`
