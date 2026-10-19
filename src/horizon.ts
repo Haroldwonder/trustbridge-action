@@ -529,7 +529,7 @@ async function fetchAccountOnce(
 
   while (attempt <= maxRetries) {
     // Bail out immediately if the job was cancelled before this attempt.
-    if (parentSignal?.aborted) {
+    if (externalSignal?.aborted) {
       throw new HorizonError(
         "Horizon request aborted (job cancelled).",
         0,
@@ -691,7 +691,7 @@ async function fetchAccountOnce(
               nextAttempt: attempt + 1,
             }),
           );
-          await cancellableSleep(retryAfter, parentSignal);
+          await cancellableSleep(retryAfter, externalSignal);
           // If the job was cancelled during the sleep, bail out on the next
           // iteration's pre-flight check rather than issuing another request.
           attempt += 1;
@@ -795,7 +795,7 @@ async function fetchAccountOnce(
 
       const isAbort = error instanceof Error && error.name === "AbortError";
       // If the parent job signal fired, propagate as a non-retryable cancellation.
-      const isJobCancelled = isAbort && parentSignal?.aborted;
+      const isJobCancelled = isAbort && externalSignal?.aborted;
       const message = isJobCancelled
         ? "Horizon request aborted (job cancelled)."
         : isAbort
@@ -854,7 +854,7 @@ async function fetchAccountOnce(
             nextAttempt: attempt + 1,
           }),
         );
-        await cancellableSleep(backoffMs, parentSignal);
+        await cancellableSleep(backoffMs, externalSignal);
         // If the job was cancelled during the backoff sleep, bail out on the
         // next iteration's pre-flight check rather than issuing another request.
         attempt += 1;
@@ -1065,36 +1065,18 @@ export async function fetchAccount(
     const fallbackNetwork = inferStellarNetwork(normalizedFallbackUrl);
     const crossNetworkFallback = primaryNetwork !== fallbackNetwork;
 
-  // Consume rate budget for the fallback request
-  if (options.rateBudgetTracker) {
-    options.rateBudgetTracker.recordRequest();
-  }
+    // Guard: block cross-network fallback unless explicitly allowed
+    if (crossNetworkFallback && !allowCrossNetwork) {
+      throw new HorizonError(
+        `Cross-network fallback from ${primaryNetwork} (${normalizedHorizonUrl}) to ${fallbackNetwork} (${normalizedFallbackUrl}) is blocked. Set allow_cross_network_fallback=true to enable.`,
+        0,
+        false,
+      );
+    }
 
-  try {
-    const fallbackResult = await fetchAccountOnce(
-      fetch,
-      normalizedFallbackUrl,
-      stellarAddress,
-      timeoutMs,
-      maxRetries,
-      'fallback',
-      options.signal,
-    );
-
-    if (cachingEnabled) {
-      cache.set(cacheKey, fallbackResult.account, cacheTtlMs);
-      const cacheStatsAfter = redactCacheStats(cache.getStats());
-      logger.debug('Horizon cache populate after fallback success', safeHorizonContext({
-        component: 'horizon',
-        stellarAddress,
-        horizonUrl,
-        horizonUrlFallback: normalizedFallbackUrl,
-        primaryNetwork,
-        fallbackNetwork,
-        primaryStatusCode: primaryError?.statusCode,
-        primaryErrorMessage: primaryError ? redactString(primaryError.message) : undefined,
-      }));
-      throw primaryError;
+    // Consume rate budget for the fallback request
+    if (options.rateBudgetTracker) {
+      options.rateBudgetTracker.recordRequest();
     }
 
     logger.debug('Horizon RPC fallback: primary exhausted, switching to fallback URL', safeHorizonContext({
@@ -1242,7 +1224,7 @@ export async function waitForFundedAccount(
       }
 
       options.onPoll?.(attempt, elapsedMs);
-      await new Promise((r) => setTimeout(r, Math.min(pollIntervalMs, timeoutMs - elapsedMs)));
+      await cancellableSleep(Math.min(pollIntervalMs, timeoutMs - elapsedMs), signal);
     }
   }
 }

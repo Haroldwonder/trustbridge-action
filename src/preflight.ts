@@ -234,7 +234,140 @@ export async function runIssuesPreflight(
   };
 }
 
-/** Extract an HTTP status code from an Octokit/RequestError-like object. */
+// ---------------------------------------------------------------------------
+// Horizon health probe (#443)
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe the Horizon root on the primary and (when set) fallback URLs.
+ *
+ * Uses `HEAD` first and falls back to `GET` when the server rejects HEAD
+ * (some Horizon deployments return 405).  A probe is considered healthy when
+ * the response status is `< 400`.
+ *
+ * By default a failed probe only emits a warning; set
+ * `options.horizonProbeHardFail` to throw a `PreflightError` instead.
+ */
+export async function runHorizonHealthProbe(
+  options: PreflightOptions,
+): Promise<void> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const warn = options.warn ?? ((message: string) => console.warn(message));
+  const timeoutMs = options.horizonProbeTimeoutMs ?? 5000;
+
+  const targets: Array<{ label: string; url: string }> = [];
+  if (options.horizonUrl) {
+    targets.push({ label: 'primary', url: options.horizonUrl });
+  }
+  if (options.horizonUrlFallback) {
+    targets.push({ label: 'fallback', url: options.horizonUrlFallback });
+  }
+
+  for (const target of targets) {
+    const result = await probeHorizonUrl(target.url, fetchImpl, timeoutMs);
+    if (result.ok) {
+      continue;
+    }
+
+    const message =
+      `Horizon ${target.label} URL health probe failed for ${target.url}: ${result.reason}. ` +
+      'The run will continue, but fetch failures may fall back to this URL mid-run.';
+
+    if (options.horizonProbeHardFail === true) {
+      throw new PreflightError(message, result.status ?? 0);
+    }
+    warn(message);
+  }
+}
+
+export interface ProbeResult {
+  ok: boolean;
+  reason: string;
+  status?: number;
+}
+
+export async function probeHorizonUrl(
+  url: string,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+): Promise<ProbeResult> {
+  const head = await fetchWithTimeout(fetchImpl, url, 'HEAD', timeoutMs);
+  if (head.ok) {
+    return { ok: true, reason: 'ok', status: head.status };
+  }
+
+  // Some servers reject HEAD (405/501) — retry with GET before giving up.
+  if (head.status === 405 || head.status === 501) {
+    const get = await fetchWithTimeout(fetchImpl, url, 'GET', timeoutMs);
+    return get.ok
+      ? { ok: true, reason: 'ok', status: get.status }
+      : { ok: false, reason: get.reason, status: get.status };
+  }
+
+  return { ok: false, reason: head.reason, status: head.status };
+}
+
+async function fetchWithTimeout(
+  fetchImpl: typeof fetch,
+  url: string,
+  method: 'HEAD' | 'GET',
+  timeoutMs: number,
+): Promise<ProbeResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl(url, {
+      method,
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+    if (response.status < 400) {
+      return { ok: true, reason: 'ok', status: response.status };
+    }
+    return {
+      ok: false,
+      reason: `HTTP ${response.status}`,
+      status: response.status,
+    };
+  } catch (error: unknown) {
+    const reason =
+      error instanceof Error && error.name === 'AbortError'
+        ? `timed out after ${timeoutMs}ms`
+        : error instanceof Error
+          ? error.message
+          : String(error);
+    return { ok: false, reason };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PreflightError
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown by `runIssuesPreflight` when the token is missing permission or the
+ * issue context is invalid.  Callers should surface this via `core.setFailed`.
+ */
+export class PreflightError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode: number,
+  ) {
+    super(message);
+    this.name = 'PreflightError';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Best-effort extraction of an HTTP status code from an Octokit error.
+ * Returns `undefined` when the error does not carry a numeric `status`.
+ */
 function extractHttpStatus(error: unknown): number | undefined {
   if (error && typeof error === 'object' && 'status' in error) {
     const status = (error as { status?: unknown }).status;

@@ -1701,3 +1701,53 @@ describe('HorizonAccount: account-level flags fixture assertions', () => {
     expect(usdcBalance?.is_authorized).toBe(true);
   });
 });
+
+describe('waitForFundedAccount AbortSignal behavior (Issue #685)', () => {
+  it('exits immediately when AbortSignal is aborted during poll wait', async () => {
+    const controller = new AbortController();
+    const fetchAccountMock = jest.fn().mockImplementation(async () => {
+      throw new HorizonError('Not found', 404, false);
+    });
+
+    const startTime = Date.now();
+    const promise = waitForFundedAccount(
+      PRIMARY_HORIZON,
+      TEST_ADDRESS,
+      {
+        timeoutMs: 60000,
+        pollIntervalMs: 10000,
+        signal: controller.signal,
+        onPoll: (attempt) => {
+          if (attempt === 1) {
+            controller.abort();
+          }
+        },
+      },
+      fetchAccountMock,
+    );
+
+    await expect(promise).rejects.toThrow(/Polling aborted|aborted/i);
+    const elapsed = Date.now() - startTime;
+    expect(elapsed).toBeLessThan(1000);
+    expect(fetchAccountMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('respects timeout when non-abort timeout elapses', async () => {
+    const fetchAccountMock = jest.fn().mockImplementation(async () => {
+      throw new HorizonError('Not found', 404, false);
+    });
+
+    const promise = waitForFundedAccount(
+      PRIMARY_HORIZON,
+      TEST_ADDRESS,
+      {
+        timeoutMs: 50,
+        pollIntervalMs: 10,
+      },
+      fetchAccountMock,
+    );
+
+    await expect(promise).rejects.toThrow(/was still not funded after waiting/i);
+  });
+});
+

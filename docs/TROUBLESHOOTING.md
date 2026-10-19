@@ -78,41 +78,44 @@ TrustBridge builds its Octokit client from `context.apiUrl` (backed by the runne
 **Helpful links:**
 - [USAGE: GitHub Projects v2 status updates](USAGE.md#github-projects-v2-status-updates-issue-222)
 
-## Stellar addresses are missing from the Actions log
+## Local Horizon Reachability Check (`npm run horizon:check`)
 
-**Symptom:** You expected to see a contributor's G-, C-, or M-address in the workflow log (for example while debugging a failed check), but the value appears as a redacted placeholder.
+Operators can run a fast local probe to validate Horizon TLS and reachability matching the action's preflight logic before running workflows.
 
-**Why this happens:** `src/logger.ts` masks Stellar addresses before they reach `core.info`/`core.debug` output. This is intentional and is the behavioral contract verified by `__tests__/logger.test.ts`. The redaction helpers match two patterns:
+### Basic usage
 
-- `STELLAR_ADDRESS_REGEX` — standard `G...` (account) and `C...` (contract) addresses.
-- `MUXED_ADDRESS_REGEX` — `M...` muxed addresses.
-
-**What is masked vs. what is not:**
-
-| Surface | Address masking |
-| --- | --- |
-| `core.info` / `core.debug` log lines | G, C, and M addresses are redacted |
-| Issue comment bodies | May show addresses (comments are user-facing output, not logs) |
-| Webhook payloads | Follow the `privacy_mode` setting (see below) |
-
-**Example — before and after redaction:**
-
-```
-# Before (raw value)
-Account GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV is unfunded
-
-# After (redacted in Actions log)
-Account [REDACTED_STELLAR_ADDRESS] is unfunded
+```bash
+HORIZON_URL=https://horizon.stellar.org npm run horizon:check
 ```
 
-**`privacy_mode` impact:** `privacy_mode` controls what is emitted in *outputs and webhook payloads* (e.g., whether full addresses are included). It does **not** disable log redaction — log masking always applies regardless of `privacy_mode`. If you need the full address for debugging, retrieve it from the issue/comment context or the Horizon response directly rather than from the log.
+### Environment variables & options
 
-**Edge cases:**
-- Federation responses that contain addresses are redacted in debug logs the same way.
-- Partial addresses embedded in error messages are still matched by the regex policy and redacted.
-- GHES log retention is the customer's responsibility; redaction reduces exposure but does not change retention policy.
+| Variable / Option | Description |
+|-------------------|-------------|
+| `HORIZON_URL` (or `--url`, `-u`) | The Horizon URL endpoint to probe (required). Sensitive parts and account addresses in URLs are automatically redacted per logger policy. |
+| `HORIZON_TIMEOUT_MS` (or `--timeout`, `-t`) | Probe timeout in milliseconds (default: `5000`). |
+| `--verbose`, `-v` | Enable verbose output. |
+| `--help`, `-h` | Show help message. |
 
-**Verification:** Run the logger test suite (`__tests__/logger.test.ts`) to confirm redaction behavior for G, C, and M addresses. Do **not** disable redaction in production workflows.
+### Exit codes
 
-**Helpful links:**
-- [ARCHITECTURE: Logging and address masking](ARCHITECTURE.md#logging-and-address-masking)
+| Code | Meaning |
+|------|---------|
+| `0` | Probe succeeded (HTTP response `< 400`). |
+| `1` | Probe failed (connection failure, timeout, or HTTP response `>= 400`). |
+| `2` | Invalid usage (missing URL or build output not found; run `npm run build` first). |
+
+### Examples
+
+```bash
+# Using environment variables
+HORIZON_URL=https://horizon.stellar.org HORIZON_TIMEOUT_MS=3000 npm run horizon:check
+
+# Using command-line arguments
+npm run horizon:check -- --url=https://horizon.stellar.org --timeout=3000 --verbose
+
+# Against local mock Horizon (from mock/horizon/docker-compose.yml)
+HORIZON_URL=http://localhost:8089 npm run horizon:check
+```
+
+The probe uses the same logic as the action's optional Horizon health probe (`horizon_probe: true`), including HEAD/GET fallback and timeout handling.
