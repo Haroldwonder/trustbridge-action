@@ -22,6 +22,21 @@ import { escapeMarkdownInline } from './markdown';
  * Run every plugin registered in `registry` against `ctx`, then
  * compose their `CheckPluginResult`s into a `ValidationResult`.
  *
+ * Discovery / load order
+ * ----------------------
+ * Plugins are executed in the deterministic order returned by
+ * `registry.list()` (see `pluginLoader` / `PluginRegistry`), which is
+ * stable across runs so CI gates do not flip on ordering. The composed
+ * `checks` array preserves that same order.
+ *
+ * Failure isolation
+ * -----------------
+ * Each plugin runs inside its own try/catch. A plugin that throws is
+ * recorded as a failed check with a stable, actionable message and the
+ * remaining plugins (including core Horizon checks) still run. A bad
+ * custom plugin therefore fails the gate but never prevents core checks
+ * from executing or reporting.
+ *
  * Composition rules
  * -----------------
  * - `valid`           — true only when every plugin passes.
