@@ -170,6 +170,7 @@ Each `CheckResultItem` maps to one ✅/❌ line in the issue comment.
 | URL normalization | Strips trailing slashes from `horizon_url` |
 | Cache | Optional in-memory TTL cache (`use_cache` + `horizon_cache_ttl_ms`, default disabled), keyed on `(horizon_url, stellar_address)`. 404s are never cached as funded. |
 | RPC fallback | On retry exhaustion, fails over to `horizon_url_fallback`/`rpc_fallback_url`. Refused by default when the fallback resolves to a different Stellar network than the primary — see `allow_cross_network_fallback`. |
+| Latency histogram | Every fetch attempt (success, 404, exhausted-retries) records its wall-clock latency into `globalHorizonHistogram` (`HorizonLatencyHistogram` in `metrics.ts`), bucketed by `[50, 100, 250, 500, 1000, 2500, 5000, +Inf]` ms and labelled `primary` or `fallback`. The snapshot is included in the Job Summary JSON artifact under `horizonFetchLatencyHistogram`. No raw addresses or URLs are stored — only the endpoint kind tag and the numeric value. |
 
 Errors are classified as **retryable** vs **terminal** to avoid masking real problems with infinite loops.
 

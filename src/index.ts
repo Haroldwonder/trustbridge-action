@@ -16,7 +16,7 @@ import { getErrorMessage, parseBooleanInput, parseNumberInput } from './inputs';
 import { formatFailureSummary } from './summary';
 import { setValidationOutputs, AssetTrustlineStatus } from './outputs';
 import { logger, emitInputsLogRecord } from './logger';
-import { globalMetrics } from './metrics';
+import { globalMetrics, writeJobSummary, globalHorizonHistogram } from './metrics';
 import { validateContractAddress, clearSpans, getSpans } from './validation';
 import { readTrustbridgeConfig } from './configReader';
 import { RateBudgetTracker, RateBudgetExhaustedError } from './resilience';
@@ -331,6 +331,8 @@ async function run(): Promise<void> {
       core.debug(JSON.stringify(spans, null, 2));
     }
   }
+
+  await writeJobSummary(globalMetrics.buildJobSummary(globalHorizonHistogram));
 
   if (result.valid) {
     core.info('All TrustBridge checks passed.');
