@@ -1500,6 +1500,8 @@ Usernames are matched **case-insensitively**. When the map is set, `stellar_addr
 
 ## Per-check named outputs (fine-grained gating)
 
+> **Note:** `check_account_funded`, `check_trustline` and `check_xlm_reserve` are **not declared in `action.yml`** and are not emitted by `src/outputs.ts`, so in a workflow they read as `''`. Until they are added to the output contract, gate on `account_funded`, `trustline_exists`, `ready` and `reason_code`, or parse `checks_json`. The authoritative output list is the [README Outputs section](../README.md#outputs).
+
 In addition to the legacy `account_funded` and `trustline_exists` outputs,
 TrustBridge exposes three named per-check outputs that map one-to-one onto
 the internal validation checks:
@@ -2987,7 +2989,43 @@ When `webhook_secret` is empty the `X-TrustBridge-Signature` header is **omitted
 | `result.account_funded` | boolean | `true` when Horizon found an active account. |
 | `result.trustline_exists` | boolean | `true` when the configured asset trustline is present. |
 | `result.xlm_balance` | string | Native XLM balance reported by Horizon (`"0"` when unfunded). |
-| `result.checks` | array | One entry per check: `{ "label": string, "passed": boolean }`. The `detail` field present in internal `ValidationResult` is intentionally excluded. |
+| `result.checks` | array | One entry per check: `{ "label": string, "passed": boolean }`. The `detail` field present in internal `ValidationResult` is intentionally excluded. Any Stellar address embedded in a `label` is redacted. |
+| `assets` | array (optional) | Per-asset trustline / clawback outcome — see [Per-asset `reason_code`](#per-asset-reason_code-issue-676). Omitted when per-asset evaluations are not supplied, so plain v1 payloads are unchanged. |
+
+#### Per-asset `reason_code` (Issue #676)
+
+When the action is given per-asset evaluations (the primary `asset_code`/`asset_issuer` pair plus every `assets_json` entry), the payload carries an **optional, additive** `assets` array. It lets dashboard automations gate on asset-level clawback without parsing the comment Markdown. `schema_version` stays `"1"`.
+
+```json
+"assets": [
+  { "asset_code": "USDC", "asset_issuer": "GA5Z...KZVN", "primary": true,  "trustline_exists": true,  "clawback_enabled": false, "reason_code": "SUCCESS" },
+  { "asset_code": "EURC", "asset_issuer": "GDHU...ARCC", "primary": false, "trustline_exists": false, "clawback_enabled": false, "reason_code": "TRUSTLINE_MISSING" },
+  { "asset_code": "TOKEN", "asset_issuer": "CAAA...D2KM", "primary": false, "trustline_exists": true,  "clawback_enabled": true,  "reason_code": "CLAWBACK_BLOCKED" }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `assets[].asset_code` | string | Asset code. |
+| `assets[].asset_issuer` | redacted string | Issuer masked to `first4…last4`, for both G-accounts and Soroban C-contracts. |
+| `assets[].primary` | boolean | `true` for the primary `asset_code`/`asset_issuer` pair (always the first entry). An `assets_json` entry that repeats the primary pair is not listed twice. |
+| `assets[].trustline_exists` | boolean | `true` when the account holds a trustline for this `code:issuer` pair. |
+| `assets[].clawback_enabled` | boolean | `true` when the trustline has `is_clawback_enabled`. Reported in both warn and strict mode. |
+| `assets[].reason_code` | `SUCCESS` \| `TRUSTLINE_MISSING` \| `CLAWBACK_BLOCKED` | Per-asset code from `schemas/reason-codes.json`. |
+
+**Precedence:**
+
+- Within one asset, `TRUSTLINE_MISSING` outranks `CLAWBACK_BLOCKED`, because a clawback flag only exists on a trustline that is present.
+- `CLAWBACK_BLOCKED` is only emitted when `clawback_strict_mode: true` is set. In warn mode a clawback-enabled asset stays `SUCCESS` with `clawback_enabled: true`.
+- The per-asset codes do not replace the run-level outcome. `result.valid` and the `reason_code` output stay authoritative for the run as a whole.
+
+**Size:** the array is capped at 100 entries (`maxItems` in the schema). Longer `assets_json` lists are truncated in the payload.
+
+**Receivers that ignore `schema_version`** and parse strictly against an older copy of the schema will reject the new key. Refresh your copy of `schemas/webhook-payload.schema.json`, or ignore unknown keys.
+
+#### Redaction policy (Issue #675)
+
+Every Stellar identifier is redacted to `first4…last4` before the payload leaves the runner, and before it is written to the debug log. This covers `stellar_address`, `assets[].asset_issuer`, and any address inside a `result.checks[].label`. It applies to classic G-accounts and to 56-character Soroban C-contract ids alike. The match uses the same StrKey rule as `validation.ts` (`C` + 55 base32 characters). An id glued to other text (for example `sac_CAAA…`) is still redacted. With `debug_mode: true` the action logs the outbound JSON, and no full 56-character G- or C-address appears in it. Receivers that hash the address therefore see only the redacted form; use `repository` + `issue_number` as the stable correlation key.
 
 **Golden fixture:** `__tests__/fixtures/webhook-payload.json` contains a canonical example of a passing-run payload and is imported by `webhook.test.ts` to verify structural compliance.
 
@@ -3121,13 +3159,16 @@ The minted GitHub OIDC token contains standard JWT claims that the receiver vali
 - **Zero long-lived secrets:** No shared webhook secret needs to be stored or rotated in GitHub Secrets.
 - **Never logged:** The action registers the minted OIDC token with `core.setSecret()` to prevent accidental exposure in runner logs.
 - **HMAC remains default:** Workflows without `webhook_auth_mode: oidc` continue using HMAC-SHA256 signing transparently.
-- **Fail-open delivery:** OIDC token errors or network timeouts log non-fatal warnings and never block comment posting or validation results.
+- **Fail-closed on token errors (Issue #674):** if the OIDC ID token cannot be minted (missing `id-token: write`, a fork `pull_request` run, a provider error, or an empty token), the step **fails** via `core.setFailed` and the webhook is **not sent**. There is no fallback to HMAC signing or to an unsigned request, so a receiver that trusts the bearer token never gets an unauthenticated delivery. The failure message is redacted: no JWT material is logged. When `webhook_url` is unset, no token is minted.
+- **Delivery errors stay non-fatal:** once a token is minted, network timeouts and receiver errors are logged as warnings and never block comment posting or validation results.
+- **`continue-on-error`:** a job step with `continue-on-error: true` still reports success after an OIDC mint failure. Do not use it on the TrustBridge step if your dashboard must receive every run.
 
 ### Troubleshooting OIDC
 
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
-| `OIDC token minting failed ... Ensure the workflow has 'permissions: id-token: write'` | Job lacks `id-token: write`, or the run is a fork `pull_request` | Add `id-token: write` to the job `permissions:`; use HMAC mode for fork-triggered runs |
+| Step fails with `OIDC token minting failed ... The job has no 'permissions: id-token: write'` and no webhook is sent | Job lacks `id-token: write`, or the run is a fork `pull_request` (forks never receive an ID token) | Add `id-token: write` to the job `permissions:`; use `webhook_auth_mode: hmac` for fork-triggered runs |
+| Step fails with `OIDC token minting failed ... The GitHub OIDC provider returned an error` | Transient provider error, or an empty token was returned | Re-run the job; OIDC mode fails closed and never falls back to HMAC or unsigned delivery |
 | Receiver returns `401`/`403` with an invalid `aud` claim | `webhook_oidc_audience` differs from the audience the receiver accepts | Set both to the exact same string (default `trustbridge-dashboard`) |
 | Receiver reports a missing or invalid `X-TrustBridge-Signature` | Receiver verifies HMAC while the action runs in OIDC mode (no signature header is sent) | Verify the bearer JWT on the receiver, or switch the action back to `webhook_auth_mode: hmac` |
 | Tokens rejected only on GHES | Receiver trusts only `https://token.actions.githubusercontent.com` | Trust `https://<your-ghes-host>/_services/token` (GHES 3.8+); see [GHES_COMPATIBILITY.md](GHES_COMPATIBILITY.md) |
