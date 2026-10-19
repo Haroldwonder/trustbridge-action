@@ -1,4 +1,4 @@
-import { HorizonBalanceCredit } from './horizon';
+import { HorizonAccount, HorizonBalanceCredit, findTrustlineBalance } from './horizon';
 
 const ASSET_CODE_REGEX = /^[A-Z0-9]{1,12}$/;
 const STELLAR_ISSUER_G_REGEX = /^G[A-Z2-7]{55}$/;
@@ -310,4 +310,78 @@ export function compareDecimalAmounts(a: string, b: string): -1 | 0 | 1 {
  */
 export function meetsMinimumBalance(balance: string, minimum: string): boolean {
   return compareDecimalAmounts(balance, minimum) >= 0;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #676 — per-asset clawback reason codes for webhook consumers.
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-asset `reason_code` values. They reuse the public catalog codes in
+ * `schemas/reason-codes.json` so webhook receivers can switch on the same
+ * strings as the top-level `reason_code` output.
+ */
+export type AssetReasonCode = 'SUCCESS' | 'TRUSTLINE_MISSING' | 'CLAWBACK_BLOCKED';
+
+/** Evaluated trustline/clawback state for one asset (primary or `assets_json`). */
+export interface AssetReasonEvaluation {
+  assetCode: string;
+  assetIssuer: string;
+  /** True for the primary `asset_code` / `asset_issuer` pair. */
+  primary: boolean;
+  trustlineExists: boolean;
+  clawbackEnabled: boolean;
+  reasonCode: AssetReasonCode;
+}
+
+/**
+ * Derive the reason code for a single asset.
+ *
+ * Precedence: a missing trustline outranks clawback (a clawback flag can only
+ * exist on a trustline that is present). A clawback-enabled trustline only
+ * yields `CLAWBACK_BLOCKED` under `clawback_strict_mode: true`; in warn mode
+ * it stays `SUCCESS` and the receiver reads `clawback_enabled` instead.
+ */
+export function deriveAssetReasonCode(
+  trustlineExists: boolean,
+  clawbackEnabled: boolean,
+  clawbackStrictMode: boolean,
+): AssetReasonCode {
+  if (!trustlineExists) return 'TRUSTLINE_MISSING';
+  if (clawbackEnabled && clawbackStrictMode) return 'CLAWBACK_BLOCKED';
+  return 'SUCCESS';
+}
+
+/**
+ * Evaluate every configured asset against a Horizon account. The primary
+ * asset is always first; `assets_json` entries follow in input order with
+ * duplicates of the primary `code:issuer` pair skipped.
+ */
+export function evaluateAssetReasonCodes(
+  account: HorizonAccount,
+  primary: AssetConfigInput,
+  extraAssets: AssetConfigInput[],
+  clawbackStrictMode: boolean,
+): AssetReasonEvaluation[] {
+  const evaluate = (asset: AssetConfigInput, isPrimary: boolean): AssetReasonEvaluation => {
+    const balance = findTrustlineBalance(account, asset.assetCode, asset.assetIssuer);
+    const trustlineExists = balance !== undefined;
+    const clawbackEnabled = trustlineExists && getAssetClawbackStatus(balance).clawbackEnabled;
+    return {
+      assetCode: asset.assetCode,
+      assetIssuer: asset.assetIssuer,
+      primary: isPrimary,
+      trustlineExists,
+      clawbackEnabled,
+      reasonCode: deriveAssetReasonCode(trustlineExists, clawbackEnabled, clawbackStrictMode),
+    };
+  };
+
+  const primaryKey = `${primary.assetCode}:${primary.assetIssuer}`;
+  return [
+    evaluate(primary, true),
+    ...extraAssets
+      .filter((asset) => `${asset.assetCode}:${asset.assetIssuer}` !== primaryKey)
+      .map((asset) => evaluate(asset, false)),
+  ];
 }

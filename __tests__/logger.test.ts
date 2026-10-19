@@ -479,3 +479,69 @@ describe('Issue #225 — Token and Private Key Redaction', () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// Issue #675 — Soroban C-address redaction aligned with validation.ts
+// ---------------------------------------------------------------------------
+describe('Issue #675 — C-address redaction coverage', () => {
+  const C_ADDRESS = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM';
+  const FULL_C = /C[A-Z2-7]{55}/;
+
+  it('masks a C-address glued to an identifier with "_" (missed by \\b)', () => {
+    const result = redactString(`sac_${C_ADDRESS}`);
+    expect(result).toBe('sac_CAAA...D2KM');
+    expect(result).not.toMatch(FULL_C);
+  });
+
+  it('masks a C-address preceded by a lowercase letter or digit 0/1/8/9', () => {
+    expect(redactString(`x${C_ADDRESS}`)).toBe('xCAAA...D2KM');
+    expect(redactString(`9${C_ADDRESS}9`)).toBe('9CAAA...D2KM9');
+  });
+
+  it('masks C-addresses inside webhook JSON', () => {
+    const json = JSON.stringify({ stellar_address: C_ADDRESS, assets: [{ asset_issuer: C_ADDRESS }] });
+    const result = redactString(json);
+    expect(result).not.toMatch(FULL_C);
+    expect(result.match(/CAAA\.\.\.D2KM/g)).toHaveLength(2);
+  });
+
+  it('does not redact a 56-char run that is part of a longer base32 run', () => {
+    const longRun = `${C_ADDRESS}AAAA`;
+    expect(redactString(longRun)).toBe(longRun);
+  });
+
+  it('redacts snake_case address keys in LogContext', () => {
+    const redacted = redactContext({ stellar_address: C_ADDRESS, asset_issuer: C_ADDRESS, issuer: C_ADDRESS });
+    expect(redacted?.stellar_address).toBe('CAAA...D2KM');
+    expect(redacted?.asset_issuer).toBe('CAAA...D2KM');
+    expect(redacted?.issuer).toBe('CAAA...D2KM');
+  });
+
+  it('debug log snapshot contains no full 56-char C-address', () => {
+    logger.setDebugMode(true);
+    const debugSpy = jest.spyOn(core, 'debug').mockImplementation(() => {});
+    try {
+      logger.debug(`Webhook payload: {"asset_issuer":"${C_ADDRESS}"}`, {
+        component: 'webhook',
+        contract: `id=${C_ADDRESS}`,
+      });
+    } finally {
+      logger.setDebugMode(false);
+    }
+    const logged = debugSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(logged).toContain('CAAA...D2KM');
+    expect(logged).not.toMatch(FULL_C);
+  });
+
+  it('leaves G-address redaction unchanged', () => {
+    expect(redactString(`Account ${VALID_G_ADDRESS} was not found`)).toBe('Account GAAA...AWHF was not found');
+    expect(redactStellarAddress(VALID_G_ADDRESS)).toBe('GAAA...AWHF');
+  });
+
+  it('redacts JWTs embedded in free-form strings (Issue #674)', () => {
+    const jwt = 'eyJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJ4In0.c2ln';
+    const result = redactString(`provider said: ${jwt}`);
+    expect(result).not.toContain(jwt);
+    expect(result).toContain('[REDACTED_JWT]');
+  });
+});

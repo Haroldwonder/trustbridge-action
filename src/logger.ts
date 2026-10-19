@@ -23,10 +23,14 @@ export interface LogContext {
  */
 const ADDRESS_CONTEXT_KEYS = new Set<string>([
   'stellarAddress',
+  'stellar_address',
   'assetIssuer',
+  'asset_issuer',
+  'issuer',
   'accountId',
   'account_id',
   'contractAddress',
+  'contract_address',
   // Issue #730 — Soroban SAC issuers are contract ids (C-addresses). Any log
   // context key that carries one must be redacted exactly like a G-address so
   // debug output never leaks a full contract id.
@@ -41,8 +45,23 @@ const ADDRESS_CONTEXT_KEYS = new Set<string>([
  * classic G-addresses (56 chars), C-addresses / Soroban contracts (56 chars),
  * and short-form M-address-like patterns (56 chars starting with M).
  * All standard StrKey addresses begin with G or C and are exactly 56 characters.
+ *
+ * Issue #675 — boundaries follow the StrKey alphabet rather than `\b`, so the
+ * match covers exactly what `validation.ts` accepts as a C-address
+ * (`/^C[A-Z2-7]{55}$/`) and a G-address, wherever it is embedded. `\b`
+ * treated `_`, lowercase letters and digits as word characters, so a
+ * contract id glued to an identifier (`sac_CAAA…`, `issuer=xCAAA…`) leaked
+ * unredacted. A 56-char run that is part of a longer base32 run is still
+ * left alone.
  */
-const STELLAR_ADDRESS_REGEX = /\b([GC][A-Z2-7]{55})\b/g;
+const STELLAR_ADDRESS_REGEX = /(?<![A-Z2-7])([GC][A-Z2-7]{55})(?![A-Z2-7])/g;
+
+/**
+ * Compact JWS/JWT (`header.payload.signature`, base64url). OIDC ID tokens
+ * must never reach a log line even inside a provider error message
+ * (Issue #674).
+ */
+const JWT_REGEX = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g;
 
 /**
  * Pattern matching muxed M-addresses in free-form text.
@@ -165,7 +184,7 @@ export function redactContractAddress(contractId: string): string {
 }
 
 /**
- * Redacts every Stellar address (G-, C-, and muxed M-addresses) and PEM
+ * Redacts every Stellar address (G-, C-, and muxed M-addresses), JWT and PEM
  * private key embedded in an arbitrary free-form string — error messages,
  * Horizon URLs, JSON snippets, stack traces, etc.
  *
@@ -181,6 +200,7 @@ export function redactString(value: string): string {
     }
     return `${prefix}[REDACTED]`;
   });
+  masked = masked.replace(JWT_REGEX, '[REDACTED_JWT]');
   // Redact muxed M-addresses (69 chars) before G/C addresses (56 chars)
   MUXED_ADDRESS_REGEX.lastIndex = 0;
   masked = masked.replace(MUXED_ADDRESS_REGEX, (match) => `${match.slice(0, 4)}...${match.slice(-4)}`);
