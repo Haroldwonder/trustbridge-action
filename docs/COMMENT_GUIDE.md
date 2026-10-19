@@ -50,6 +50,32 @@ When `comment_mode: 'reply'` is configured, TrustBridge:
 3. If no previous TrustBridge comment exists on the issue, TrustBridge posts the initial comment cleanly without a reply prefix.
 4. On GitHub Discussions, TrustBridge uses GraphQL `addDiscussionComment` with `replyToId` to post threaded replies in the discussion thread.
 
+### `comment_id` output (Issue #696)
+
+Every successful post publishes the numeric REST comment id as the `comment_id` action output, next to `comment_url`. `upsertIssueComment` in `src/comment.ts` returns `{ url, id }` from the response of whichever call actually wrote the body, and `setValidationOutputs` publishes it.
+
+How `posting_mode` and `comment_mode` decide between update and create:
+
+| `posting_mode` | `comment_mode` (`sticky_comment`) | Prior TrustBridge comment | API call | `comment_id` |
+| --- | --- | --- | --- | --- |
+| `post` | `sticky` (`true`) | found | `issues.updateComment` | id of the existing comment |
+| `post` | `sticky` (`true`) | found, but update fails | `issues.createComment` (fallback) | id of the **new** comment |
+| `post` | `sticky` (`true`) | not found / lookup fails | `issues.createComment` | id of the new comment |
+| `post` | `sticky` (`true`) | found, snooze window active | none | id of the existing comment |
+| `post` | `new` (`false`) | any | `issues.createComment` | id of the new comment |
+| `post` | `reply` | any | `issues.createComment` (with reply header) | id of the reply |
+| `dry-run` | any | any | none | `""` |
+| `off` | any | any | none | `""` |
+
+Notes:
+
+- With an explicit `issue_number` (e.g. `workflow_dispatch`), the lookup and the id refer to that issue. With no issue or PR context the post is skipped with a warning and `comment_id` is `""`; the job is not failed.
+- A failed post is downgraded to a warning and leaves `comment_id` empty.
+- The id is always a REST issue-comment id. Discussion comments (GraphQL node ids such as `DC_…`) are not published as `comment_id`.
+- `comment_id` is not part of the dashboard webhook payload, so `privacy_mode` has nothing extra to redact.
+
+See [USAGE.md — `comment_id`](USAGE.md#comment_id--chaining-a-follow-up-edit-issue-696) for a workflow that edits the comment in a later step.
+
 ---
 ## FAQ deep links
 
