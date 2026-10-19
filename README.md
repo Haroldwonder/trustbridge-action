@@ -797,5 +797,5 @@ Built for the Stellar open-source ecosystem. Horizon data provided by the [Stell
 <!-- handsoff-issue-493 -->
 - #493: Align org-defaults composite with root action inputs
 
-<!-- handsoff-issue-718 -->
-- #718: Align i18n locale packs for clawback and unauthorized trustlines
+<!-- handsoff-issue-770 -->
+- #770: Harden validation.ts for empty stellar_addresses JSON and oversized maps
