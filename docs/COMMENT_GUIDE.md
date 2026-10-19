@@ -17,6 +17,12 @@ Every TrustBridge issue comment follows a fixed section order:
 7. **Optional sections** (in order): ledger freshness alert, network-passphrase mismatch, delta section, validation gate, balances, setup cost estimate, Stellar Lab / LOBSTR links, SEP-0007 deep links, SEP-0010 proof, remediation, configuration summary, action outputs reference, hardened metrics, expert diagnostics (debug mode only).
 8. **Footer** — `_Posted by [trustbridge-action](…)_`
 
+### Oversized comments
+
+Comments are kept below a 64,000-byte formatting budget and a 65,536-byte posting limit. If content exceeds the formatting budget, the remediation body is shortened first; the results and onboarding checklist stay ahead of lower-priority optional sections. If the remaining body still exceeds the posting limit, both issue (REST) and discussion (GraphQL) paths use the same UTF-8-safe truncator before calling GitHub.
+
+Every shortened body includes the hidden `trustbridge-action:comment-truncated` metadata marker and ends with the stable `... [Truncated due to GitHub length limits. See workflow logs for full details.]` notice. The truncator prefers a line boundary, never cuts a Unicode surrogate pair, and preserves the TrustBridge footer. In dry-run workflows, formatting still emits the truncation notice and metadata, so the body indicates what would be shortened without making a GitHub API request.
+
 ---
 
 ## Comment threading & posting modes (`comment_mode` & `posting_mode`)
@@ -344,4 +350,3 @@ You can customize the check configuration by setting `INPUT_*` environment varia
 ```bash
 INPUT_ASSET_CODE="EURC" INPUT_MIN_XLM_RESERVE="2.5" npm run preview-comment fixtures/account-funded.json
 ```
-
