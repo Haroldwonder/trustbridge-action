@@ -1,8 +1,14 @@
 import * as tls from 'tls';
 import * as crypto from 'crypto';
 import { defaultCache, SimpleCache } from './cache';
-import { logger, redactHorizonUrl, redactString, LogContext } from './logger';
-import { RateBudgetTracker, RateBudgetExhaustedError } from './resilience';
+import { logger, redactHorizonUrl, redactStellarAddress, redactString, LogContext } from './logger';
+import { inferStellarNetworkPreset } from './links';
+import { globalMetrics } from './metrics';
+import { RateBudgetTracker, CircuitBreaker, CircuitOpenError } from './resilience';
+import { validateHorizonUrl } from './validation';
+import { traceHorizonFetch } from './tracing';
+import { createProxiedFetch } from './proxy';
+
 export interface HorizonBalanceNative {
   balance: string;
   asset_type: "native";
@@ -217,9 +223,48 @@ export interface FetchAccountOptions {
   cacheTtlMs?: number;
   cache?: SimpleCache;
   fetchFn?: FetchLike;
-  rateBudgetTracker?: RateBudgetTracker;
-  /** Optional AbortSignal to cancel the request early. */
+  /**
+   * Optional AbortSignal from a parent controller (e.g. job cancellation).
+   * When the signal fires, in-flight and pending requests are aborted
+   * immediately; no misleading "account not funded" result is produced.
+   */
   signal?: AbortSignal;
+  horizonMaxRequests?: number;
+  retryBaseDelayMs?: number;
+  retryMaxDelayMs?: number;
+  retryMaxTotalWaitMs?: number;
+  rateBudgetTracker?: RateBudgetTracker;
+  /**
+   * Optional circuit breaker for Horizon fetches (Issue #209).
+   * When the circuit is open, requests are fast-failed without reaching
+   * the network. Cache hits bypass the circuit breaker.
+   */
+  circuitBreaker?: CircuitBreaker;
+  /**
+   * By default, a fallback URL that resolves to a *different* Stellar
+   * network than the primary `horizon_url` (public vs testnet, inferred
+   * from the URL) is never used — a G-address is valid on every network,
+   * so a cross-network fallback can silently return funded/trustline/
+   * reserve data for the wrong ledger instead of failing loudly. Set this
+   * to `true` to opt into cross-network fallback anyway (e.g. deliberate
+   * multi-network setups).
+   */
+  allowCrossNetworkFallback?: boolean;
+  /**
+   * Alias for `allowCrossNetworkFallback` kept for older call sites / tests.
+   * Prefer `allowCrossNetworkFallback`.
+   */
+  allowCrossNetworkFailover?: boolean;
+  /** Optional secondary Horizon URL used for same-network failover. */
+  secondaryHorizonUrl?: string;
+  /**
+   * Optional SHA-256 certificate fingerprint to pin the Horizon TLS cert.
+   * When set, a pre-flight TLS probe is performed before the first fetch.
+   * Mismatch throws HorizonPinMismatchError immediately (not retried).
+   * Leave empty (default) to use standard WebPKI certificate validation only.
+   * (Issue #303)
+   */
+  pinFingerprint?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -516,8 +561,13 @@ async function fetchAccountOnce(
   stellarAddress: string,
   timeoutMs: number,
   maxRetries: number,
-  endpointKind: 'primary' | 'fallback',
-  externalSignal?: AbortSignal,
+  endpointKind: "primary" | "fallback",
+  retryMaxDelayMs: number,
+  retryMaxTotalWaitMs: number,
+  parentSignal?: AbortSignal,
+  rateBudgetTracker?: RateBudgetTracker,
+  circuitBreaker?: CircuitBreaker,
+  retryBaseDelayMs: number = DEFAULT_RETRY_BASE_DELAY_MS,
 ): Promise<FetchOnceResult> {
   const normalizedHorizonUrl = normalizeHorizonUrl(targetHorizonUrl);
   const url = `${normalizedHorizonUrl}/accounts/${stellarAddress}`;
@@ -541,26 +591,26 @@ async function fetchAccountOnce(
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-    // If external signal is provided, abort our controller when it aborts
-    const onExternalAbort = () => controller.abort();
-    if (externalSignal) {
-      if (externalSignal.aborted) {
-        clearTimeout(timer);
-        throw new HorizonError('Horizon request aborted', 499, false);
-      }
-      externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    // Propagate the parent cancellation signal to the per-request controller.
+    let parentAbortHandler: (() => void) | undefined;
+    if (parentSignal) {
+      parentAbortHandler = () => controller.abort();
+      parentSignal.addEventListener("abort", parentAbortHandler);
     }
 
-    logger.debug('Horizon fetch start', safeHorizonContext({
-      component: 'horizon',
-      stellarAddress,
-      horizonUrl: targetHorizonUrl,
-      endpointKind,
-      attempt,
-      maxAttempts: maxRetries + 1,
-      timeoutMs,
-      url: safeUrlForLog,
-    }));
+    logger.debug(
+      "Horizon fetch start",
+      safeHorizonContext({
+        component: "horizon",
+        stellarAddress,
+        horizonUrl: targetHorizonUrl,
+        endpointKind,
+        attempt,
+        maxAttempts: maxRetries + 1,
+        timeoutMs,
+        url: safeUrlForLog,
+      }),
+    );
 
     try {
       if (rateBudgetTracker) {
@@ -627,9 +677,15 @@ async function fetchAccountOnce(
               retryable,
               latencyMs,
               attempt,
-              errorDetail: redactString(detail),
-              errorType: body.type ? redactString(body.type) : undefined,
-              errorTitle: body.title ? redactString(body.title) : undefined,
+              // Issue #697: never log Horizon response bodies on retryable
+              // (429/5xx) responses — they can echo request details back.
+              ...(retryable
+                ? { bodyOmitted: true }
+                : {
+                    errorDetail: redactString(detail),
+                    errorType: body.type ? redactString(body.type) : undefined,
+                    errorTitle: body.title ? redactString(body.title) : undefined,
+                  }),
             }),
           );
         } catch {
@@ -655,16 +711,33 @@ async function fetchAccountOnce(
           // When the header is missing or the value exceeds the cap, fall back
           // to exponential backoff so the action never waits unbounded.
           let retryAfter: number;
+          let retryAfterCapped: boolean;
           if (retryAfterHeader !== null) {
             retryAfter = Math.min(retryAfterHeader, retryMaxDelayMs);
+            retryAfterCapped = retryAfterHeader > retryMaxDelayMs;
           } else {
             retryAfter = Math.min(
               retryBaseDelayMs * 2 ** attempt,
               retryMaxDelayMs,
             );
+            retryAfterCapped = retryBaseDelayMs * 2 ** attempt > retryMaxDelayMs;
           }
 
           if (totalWaitMs + retryAfter > retryMaxTotalWaitMs) {
+            logger.horizonRetry({
+              phase: "exhausted",
+              reason: "wait_budget",
+              attempt,
+              maxAttempts: maxRetries + 1,
+              status: response.status,
+              delayMs: 0,
+              capped: retryAfterCapped,
+              kind: "http",
+              endpointKind,
+              horizonUrl: normalizedHorizonUrl,
+              stellarAddress,
+              retryAfterFromHeader: retryAfterHeader !== null,
+            });
             throw new HorizonRateLimitError(
               `Horizon retry wait budget exhausted (total wait ${totalWaitMs + retryAfter}ms exceeds cap of ${retryMaxTotalWaitMs}ms). Please try again later.`,
               retryAfter,
@@ -673,24 +746,19 @@ async function fetchAccountOnce(
 
           totalWaitMs += retryAfter;
 
-          logger.debug(
-            "Horizon retry scheduled",
-            safeHorizonContext({
-              component: "horizon",
-              stellarAddress,
-              horizonUrl: targetHorizonUrl,
-              endpointKind,
-              status: response.status,
-              retryable,
-              latencyMs,
-              attempt,
-              retryAfterMs: retryAfter,
-              retryAfterFromHeader: retryAfterHeader !== null,
-              retryAfterCapped:
-                retryAfterHeader !== null && retryAfterHeader > retryMaxDelayMs,
-              nextAttempt: attempt + 1,
-            }),
-          );
+          logger.horizonRetry({
+            phase: "scheduled",
+            attempt,
+            maxAttempts: maxRetries + 1,
+            status: response.status,
+            delayMs: retryAfter,
+            capped: retryAfterCapped,
+            kind: "http",
+            endpointKind,
+            horizonUrl: normalizedHorizonUrl,
+            stellarAddress,
+            retryAfterFromHeader: retryAfterHeader !== null,
+          });
           await cancellableSleep(retryAfter, parentSignal);
           // If the job was cancelled during the sleep, bail out on the next
           // iteration's pre-flight check rather than issuing another request.
@@ -712,6 +780,22 @@ async function fetchAccountOnce(
             final: true,
           }),
         );
+
+        if (retryable) {
+          logger.horizonRetry({
+            phase: "exhausted",
+            reason: "max_retries",
+            attempt,
+            maxAttempts: maxRetries + 1,
+            status: response.status,
+            delayMs: 0,
+            capped: false,
+            kind: "http",
+            endpointKind,
+            horizonUrl: normalizedHorizonUrl,
+            stellarAddress,
+          });
+        }
 
         throw new HorizonError(
           `Horizon request failed (${response.status}): ${detail}`,
@@ -828,32 +912,46 @@ async function fetchAccountOnce(
 
       lastError = new HorizonError(message, isAbort ? 408 : 0, true);
 
+      const transportKind = isAbort ? "timeout" : "network";
+
       if (attempt < maxRetries) {
         const backoffMs = Math.min(
           retryBaseDelayMs * 2 ** attempt,
           retryMaxDelayMs,
         );
+        const backoffCapped = retryBaseDelayMs * 2 ** attempt > retryMaxDelayMs;
 
         if (totalWaitMs + backoffMs > retryMaxTotalWaitMs) {
+          logger.horizonRetry({
+            phase: "exhausted",
+            reason: "wait_budget",
+            attempt,
+            maxAttempts: maxRetries + 1,
+            status: 0,
+            delayMs: 0,
+            capped: backoffCapped,
+            kind: transportKind,
+            endpointKind,
+            horizonUrl: normalizedHorizonUrl,
+            stellarAddress,
+          });
           throw lastError;
         }
 
         totalWaitMs += backoffMs;
 
-        logger.debug(
-          "Horizon transport retry scheduled",
-          safeHorizonContext({
-            component: "horizon",
-            stellarAddress,
-            horizonUrl: targetHorizonUrl,
-            endpointKind,
-            kind: isAbort ? "timeout" : "network",
-            latencyMs,
-            attempt,
-            retryAfterMs: backoffMs,
-            nextAttempt: attempt + 1,
-          }),
-        );
+        logger.horizonRetry({
+          phase: "scheduled",
+          attempt,
+          maxAttempts: maxRetries + 1,
+          status: 0,
+          delayMs: backoffMs,
+          capped: backoffCapped,
+          kind: transportKind,
+          endpointKind,
+          horizonUrl: normalizedHorizonUrl,
+          stellarAddress,
+        });
         await cancellableSleep(backoffMs, parentSignal);
         // If the job was cancelled during the backoff sleep, bail out on the
         // next iteration's pre-flight check rather than issuing another request.
@@ -868,18 +966,32 @@ async function fetchAccountOnce(
           stellarAddress,
           horizonUrl: targetHorizonUrl,
           endpointKind,
-          kind: isAbort ? "timeout" : "network",
+          kind: transportKind,
           latencyMs,
           attempt,
           final: true,
         }),
       );
 
+      logger.horizonRetry({
+        phase: "exhausted",
+        reason: "max_retries",
+        attempt,
+        maxAttempts: maxRetries + 1,
+        status: 0,
+        delayMs: 0,
+        capped: false,
+        kind: transportKind,
+        endpointKind,
+        horizonUrl: normalizedHorizonUrl,
+        stellarAddress,
+      });
+
       throw lastError;
     } finally {
       clearTimeout(timer);
-      if (externalSignal) {
-        externalSignal.removeEventListener('abort', onExternalAbort);
+      if (parentSignal && parentAbortHandler) {
+        parentSignal.removeEventListener("abort", parentAbortHandler);
       }
     }
   }
@@ -937,23 +1049,15 @@ export async function fetchAccount(
     const fetch: FetchLike =
       options.fetchFn ?? (await import('node-fetch')).default;
 
-  // Consume rate budget for the primary request (after cache miss)
-  if (options.rateBudgetTracker) {
-    options.rateBudgetTracker.recordRequest();
-  }
+    // Bail out immediately if the job was already cancelled before we start.
+    if (signal?.aborted) {
+      throw new HorizonError('Horizon request aborted (job cancelled).', 0, false);
+    }
 
-  let primaryError: HorizonError | undefined;
-
-  try {
-    const result = await fetchAccountOnce(
-      fetch,
-      normalizedHorizonUrl,
-      stellarAddress,
-      timeoutMs,
-      maxRetries,
-      'primary',
-      options.signal,
-    );
+    const cachingEnabled = cacheTtlMs > 0;
+    const cacheKey = cachingEnabled
+      ? buildCacheKey(normalizedHorizonUrl, stellarAddress)
+      : '';
 
     if (cachingEnabled) {
       const cacheStatsBefore = redactCacheStats(cache.getStats());
@@ -1061,30 +1165,12 @@ export async function fetchAccount(
     // could silently return funded/trustline/reserve data for the *wrong*
     // ledger instead of failing loudly. Compare the inferred networks and
     // refuse the fallback unless the caller explicitly opted in.
-    const primaryNetwork = inferStellarNetwork(normalizedHorizonUrl);
-    const fallbackNetwork = inferStellarNetwork(normalizedFallbackUrl);
+    const primaryNetwork = inferStellarNetworkPreset(normalizedHorizonUrl);
+    const fallbackNetwork = inferStellarNetworkPreset(normalizedFallbackUrl);
     const crossNetworkFallback = primaryNetwork !== fallbackNetwork;
 
-  // Consume rate budget for the fallback request
-  if (options.rateBudgetTracker) {
-    options.rateBudgetTracker.recordRequest();
-  }
-
-  try {
-    const fallbackResult = await fetchAccountOnce(
-      fetch,
-      normalizedFallbackUrl,
-      stellarAddress,
-      timeoutMs,
-      maxRetries,
-      'fallback',
-      options.signal,
-    );
-
-    if (cachingEnabled) {
-      cache.set(cacheKey, fallbackResult.account, cacheTtlMs);
-      const cacheStatsAfter = redactCacheStats(cache.getStats());
-      logger.debug('Horizon cache populate after fallback success', safeHorizonContext({
+    if (crossNetworkFallback && !allowCrossNetwork) {
+      logger.debug('Horizon RPC fallback skipped: primary and fallback resolve to different networks', safeHorizonContext({
         component: 'horizon',
         stellarAddress,
         horizonUrl,
@@ -1172,6 +1258,34 @@ export async function fetchAccount(
       throw fallbackError;
     }
   });
+}
+
+/**
+ * Fetch the asset issuer account for the SEP-0001 home domain check (Issue
+ * #708). Returns `null` when the issuer is not a classic G-address (Soroban
+ * contract issuers have no `home_domain`) or when Horizon can't return it,
+ * so the check reports "missing" instead of failing the whole run.
+ */
+export async function fetchHomeDomainIssuerAccount(
+  horizonUrl: string,
+  assetIssuer: string,
+  options: FetchAccountOptions = {},
+): Promise<HorizonAccount | null> {
+  const issuer = assetIssuer.trim();
+  if (!/^G[A-Z2-7]{55}$/.test(issuer)) {
+    return null;
+  }
+  try {
+    return await fetchAccount(horizonUrl, issuer, options);
+  } catch (error) {
+    logger.debug('Home domain issuer account unavailable', {
+      component: 'horizon',
+      assetIssuer: issuer,
+      horizonUrl,
+      errorMessage: error instanceof Error ? redactString(error.message) : 'unknown error',
+    });
+    return null;
+  }
 }
 
 export interface WaitForFundedAccountOptions {

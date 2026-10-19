@@ -10,9 +10,14 @@ blocking the default USDC payout flow.
 ## How it works
 
 Stellar accounts can set a `home_domain` field directly on-chain. Horizon
-exposes this value in the account resource. TrustBridge reads it from the
-issuer account returned by Horizon and checks it against an optional expected
-value you configure.
+exposes this value in the account resource. When `home_domain_check_enabled`
+is true, TrustBridge fetches the **asset issuer** account (`asset_issuer`)
+from `horizon_url` and checks its `home_domain` against an optional expected
+value you configure. In batch mode the issuer is fetched once and every
+address row is evaluated against it.
+
+If the issuer account can't be fetched, or the issuer is a Soroban contract
+(C-address, which has no `home_domain`), the outcome is `missing`.
 
 The check is **purely on-chain** — it does **not** fetch or verify the
 `stellar.toml` file over HTTP. Full SEP-0001 HTTP fetch and TOML signature
@@ -62,6 +67,46 @@ Add the inputs to your workflow step:
 | `home_domain_check_enabled` | `false` | Enable the SEP-0001 home domain check. |
 | `expected_home_domain` | _(empty)_ | Domain the issuer must have on-chain. If empty, any non-empty value passes. |
 | `home_domain_check_mode` | `warn` | `warn` = informational. `strict` = blocks `valid` on failure. |
+| `sarif_output_path` | _(empty)_ | When set, the SARIF report written to this path (inside `GITHUB_WORKSPACE`) includes rule `TB004` for the home domain check. |
+
+### Empty vs mismatched `home_domain`
+
+- **Empty / unset** on-chain `home_domain` (or issuer unavailable): outcome
+  `missing`, reason code `HOME_DOMAIN_MISSING` in strict mode. The fix is
+  for the issuer to set a home domain.
+- **Set but different** from `expected_home_domain`: outcome `mismatch`,
+  reason code `HOME_DOMAIN_MISMATCH` in strict mode. This can mean the
+  configured asset is not the one you intended to pay out, so check
+  `asset_issuer` before changing `expected_home_domain`.
+
+## Reason codes
+
+| Mode | Outcome | `ready` | `reason_code` |
+|---|---|---|---|
+| `strict` | `mismatch` | `false` | `HOME_DOMAIN_MISMATCH` |
+| `strict` | `missing` | `false` | `HOME_DOMAIN_MISSING` |
+| `warn` | `mismatch` / `missing` | unchanged | unchanged (for example `SUCCESS`) |
+| any | `valid` | unchanged | unchanged |
+
+Failures in the trustline, reserve or other account checks take precedence:
+the home domain codes are used only when the home domain is the reason the
+run failed.
+
+## SARIF and Check Runs
+
+When `sarif_output_path` is set and the check is enabled, the SARIF report
+contains rule **`TB004` (`HomeDomainAligned`)**. Its help links back to this
+page.
+
+| Outcome | SARIF level |
+|---|---|
+| `valid` | `none` |
+| `mismatch` / `missing` in `strict` mode | `error` |
+| `mismatch` / `missing` in `warn` mode | `warning` |
+
+In Check Runs built by `src/checks-run.ts`, the home domain annotation is a `failure` in
+strict mode and a `warning` in warn mode, and a failing Check Run summary
+includes the `reason_code`.
 
 ---
 
@@ -102,9 +147,14 @@ TrustBridge comment table:
 | XLM reserve | ✅ |
 | **SEP-0001 home domain** | ✅ `centre.io` ✓ |
 
-In `warn` mode a failing row is marked informational and does not change the
-overall result. In `strict` mode the row fails and, when `fail_on_missing: true`
-is set, the workflow step exits with a non-zero status.
+In `warn` mode a failing row stays passing but is prefixed with ⚠️ and marked
+"Warning only", so the problem is visible without changing the overall result.
+In `strict` mode the row fails, the comment's **Remediation** section explains
+the mismatch (actual vs expected domain) or the missing domain, and, when
+`fail_on_missing: true` is set, the workflow step exits with a non-zero status.
+
+Domain strings are public issuer metadata, so they appear in comments and
+SARIF messages. They are not written to debug logs by the home domain check.
 
 ---
 
@@ -160,10 +210,9 @@ The `evaluateHomeDomain(issuerAccount, config)` helper is also exported from
 - **On-chain data only.** TrustBridge reads the `home_domain` field already
   present in the Horizon account resource. It does **not** resolve the domain
   via DNS, fetch the `stellar.toml` file, or verify any signatures.
-- **Issuer account availability.** The `home_domain` field is read from the
-  account currently held in the TrustBridge execution context. In most
-  deployments this is the *wallet* account, not the *issuer* account. A future
-  enhancement will add an optional issuer-account prefetch.
+- **Issuer account availability.** The issuer account is fetched with one
+  extra Horizon request per run (one per batch). It counts toward
+  `horizon_max_requests`. If that request fails, the outcome is `missing`.
 - **Horizon data freshness.** Horizon may cache account data. Set
   `horizon_cache_ttl_ms: 0` if you need the latest on-chain state for
   compliance checks.

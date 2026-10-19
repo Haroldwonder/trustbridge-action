@@ -21,6 +21,8 @@ import {
   TrustBridgeCheckOutcome,
   SarifDocument,
   SarifUploadFn,
+  HOME_DOMAIN_RULE_ID,
+  HOME_DOMAIN_HELP_URI,
 } from '../src/sarif';
 
 const TEST_ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
@@ -248,5 +250,58 @@ describe('buildSarifDocument: custom asset and testnet horizon', () => {
     );
     const tb002Rule = doc.runs[0].tool.driver.rules.find((r) => r.id === 'TB002');
     expect(tb002Rule?.shortDescription.text).toContain('EURC');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #708 — SEP-0001 home domain rule (TB004)
+// ---------------------------------------------------------------------------
+
+describe('buildSarifDocument: home domain fixture (Issue #708)', () => {
+  const mismatchFixture = makeOutcome({
+    homeDomain: {
+      outcome: 'mismatch',
+      mode: 'strict',
+      actualHomeDomain: 'evil.example',
+      expectedHomeDomain: 'centre.io',
+    },
+  });
+
+  it('adds a stable TB004 rule with markdown help when the check ran', () => {
+    const doc = buildSarifDocument(mismatchFixture);
+    const rules = doc.runs[0].tool.driver.rules;
+    expect(rules.map((r) => r.id)).toEqual(['TB001', 'TB002', 'TB003', HOME_DOMAIN_RULE_ID]);
+    const rule = rules[3];
+    expect(rule.id).toBe('TB004');
+    expect(rule.name).toBe('HomeDomainAligned');
+    expect(rule.helpUri).toBe(HOME_DOMAIN_HELP_URI);
+    expect(rule.help?.markdown).toContain('HOME_DOMAIN_MISMATCH');
+  });
+
+  it('emits an error-level result for a strict mismatch', () => {
+    const result = buildSarifDocument(mismatchFixture).runs[0].results.find(
+      (r) => r.ruleId === HOME_DOMAIN_RULE_ID,
+    );
+    expect(result?.level).toBe('error');
+    expect(result?.message.text).toContain('evil.example');
+    expect(result?.message.text).toContain('centre.io');
+  });
+
+  it('emits a warning-level result for a warn-mode missing domain', () => {
+    const doc = buildSarifDocument(makeOutcome({ homeDomain: { outcome: 'missing', mode: 'warn' } }));
+    const result = doc.runs[0].results.find((r) => r.ruleId === HOME_DOMAIN_RULE_ID);
+    expect(result?.level).toBe('warning');
+    expect(result?.message.text).toContain('no home_domain');
+  });
+
+  it('omits TB004 for a skipped outcome', () => {
+    const doc = buildSarifDocument(makeOutcome({ homeDomain: { outcome: 'skipped', mode: 'strict' } }));
+    expect(doc.runs[0].tool.driver.rules).toHaveLength(3);
+    expect(doc.runs[0].results).toHaveLength(3);
+  });
+
+  it('round-trips the home domain rule through serialiseSarif', () => {
+    const parsed = JSON.parse(serialiseSarif(buildSarifDocument(mismatchFixture))) as SarifDocument;
+    expect(parsed.runs[0].results.some((r) => r.ruleId === HOME_DOMAIN_RULE_ID)).toBe(true);
   });
 });

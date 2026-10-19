@@ -385,9 +385,19 @@ Using `network: testnet` automatically populates:
 > **Network safety validation:**
 > TrustBridge validates network compatibility before fetching account data. Combining a testnet Horizon endpoint with a mainnet asset issuer (e.g. mainnet USDC `GA5ZSEJY...`) fails fast with an explicit error to prevent accidental configuration errors.
 
-### Automatic Friendbot funding for testnet (Issue #4)
+### Friendbot testnet funding
 
-For testnet campaigns, TrustBridge can automatically call Stellar Friendbot to fund new accounts that return 404 ("not found") errors. This streamlines testnet onboarding by removing the manual step of visiting Friendbot before assignment.
+For testnet and futurenet campaigns, TrustBridge can call Stellar Friendbot to fund a new account when Horizon returns 404 ("not found"). Contributors then don't have to visit Friendbot themselves before assignment.
+
+#### Inputs
+
+| Input | Default | Constraints |
+| --- | --- | --- |
+| `use_friendbot` | `false` | Opt-in. Only acts when the account lookup returns 404 **and** `horizon_url` is a test network (testnet or futurenet). Ignored on pubnet. |
+| `friendbot_url` | `https://friendbot.stellar.org` | Must be HTTPS and on the Friendbot allowlist (see below). Path must be empty or `/friendbot`; `/friendbot` is added when missing. Use `https://friendbot-futurenet.stellar.org` on futurenet. |
+| `friendbot_timeout_ms` | `15000` | Per-request timeout, clamped to `1000`–`60000` ms. A timeout is reported as a failed funding attempt. It does not fail the job on its own. |
+
+The default `friendbot_url` is the **testnet** Friendbot. For futurenet, set both `horizon_url` and `friendbot_url` to the futurenet hosts (see [Network presets](#network-presets)).
 
 #### Enabling Friendbot
 
@@ -397,39 +407,48 @@ with:
   stellar_address_input: ${{ steps.lookup.outputs.address }}
   use_friendbot: true
   friendbot_url: 'https://friendbot.stellar.org'
+  friendbot_timeout_ms: 15000
   github_token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-**How it works:**
+A complete caller workflow that passes these inputs through the reusable workflow is in [`docs/examples/friendbot-testnet-onboarding.yml`](examples/friendbot-testnet-onboarding.yml). It uses the `use_friendbot`, `friendbot_url` and `friendbot_timeout_ms` inputs of [`trustbridge-reusable.yml`](examples/trustbridge-reusable.yml).
 
-1. TrustBridge attempts to fetch the account from Horizon
-2. If the account doesn't exist (404), and `use_friendbot: true`:
-   - Calls the specified `friendbot_url` with the account address
-   - Waits for Friendbot to fund the account
-   - Retries the Horizon fetch
-3. Proceeds with normal validation checks
+**From input to funded account:**
+
+1. TrustBridge fetches the account from `horizon_url`.
+2. If Horizon returns anything other than 404, Friendbot is not involved.
+3. On 404 with `use_friendbot: true`, TrustBridge checks `horizon_url`:
+   - **Pubnet** (`https://horizon.stellar.org`, or any URL containing `mainnet` / `public.stellar.org`): Friendbot is skipped, a warning is logged, and `friendbot_called` stays `false`. The account is reported as unfunded.
+   - **Test network** (URL containing `testnet`, `test`, or `futurenet`): continue.
+4. `friendbot_url` is checked against the allowlist. A URL that is not allowlisted is refused without any network request.
+5. TrustBridge sends one `GET <friendbot_url>/friendbot?addr=<address>` request, bounded by `friendbot_timeout_ms`. Friendbot is called **at most once per run**, so retries never cause a second funding request.
+6. On success, TrustBridge fetches the account from Horizon again and runs the normal checks against the funded account.
+7. On failure (HTTP error, timeout, network error), the run continues with the original "account not funded" result.
 
 #### Safety guarantees
 
-**Network guard:** Friendbot is **only** available on testnet. Mainnet/public network requests always refuse friendbot calls, even if `use_friendbot: true`.
+**Network guard:** Friendbot only runs against test networks. Pubnet runs never call Friendbot, even when `use_friendbot: true`.
 
 ```yaml
-# ❌ This configuration is blocked
+# ❌ Friendbot is skipped for this configuration
 with:
   horizon_url: https://horizon.stellar.org  # Public network
-  use_friendbot: true  # BLOCKED: Cannot use friendbot on mainnet
+  use_friendbot: true  # Skipped: Friendbot is never called on pubnet
 ```
 
-**SSRF protection:** Only official Stellar friendbot endpoints are allowed:
-- `https://friendbot.stellar.org`
-- `https://horizon-testnet.stellar.org/friendbot`
-- `friendbot-testnet.stellar.org`
+**SSRF protection:** Only these official Friendbot hosts are allowed:
 
-Custom or third-party friendbot URLs are rejected to prevent SSRF attacks.
+- `https://friendbot.stellar.org` (testnet)
+- `https://friendbot-testnet.stellar.org` (testnet)
+- `https://horizon-testnet.stellar.org/friendbot` (testnet)
+- `https://friendbot-futurenet.stellar.org` (futurenet)
+- `https://horizon-futurenet.stellar.org/friendbot` (futurenet)
+
+TrustBridge rejects custom or third-party Friendbot URLs, plain `http://` URLs, and any other path on an allowlisted host.
 
 #### Friendbot outputs
 
-Use these outputs to track friendbot activity in your workflow:
+Use these outputs to track Friendbot activity in your workflow:
 
 ```yaml
 - id: trustbridge
@@ -450,40 +469,98 @@ Use these outputs to track friendbot activity in your workflow:
     fi
 ```
 
-**Available outputs:**
-- `friendbot_called`: `"true"` if Friendbot was called this run
-- `friendbot_success`: `"true"` if the funding succeeded
-- `friendbot_transaction_hash`: Transaction hash from successful funding
+| Output | Not called (or skipped on pubnet) | Funding succeeded | Funding failed |
+| --- | --- | --- | --- |
+| `friendbot_called` | `"false"` | `"true"` | `"true"` |
+| `friendbot_success` | `"false"` | `"true"` | `"false"` |
+| `friendbot_transaction_hash` | `""` | transaction hash | `""` |
 
 #### When to use Friendbot
 
 ✅ **Good use cases:**
+
 - Onboarding new contributors to testnet campaigns
 - Automated testnet wallet provisioning
 - CI/CD pipelines that create ephemeral test accounts
 
 ❌ **Not recommended:**
-- Mainnet/public network (blocked by design)
+
+- Mainnet/public network (skipped by design)
 - Production workflows (testnet only)
 - When you need to control the exact funding amount (Friendbot uses standard amounts)
 
 #### Troubleshooting
 
-**"Friendbot is only available for testnet"**
-- Your `horizon_url` points to mainnet, not testnet
+See [TROUBLESHOOTING.md — Friendbot funding failed](TROUBLESHOOTING.md#friendbot-funding-failed) for common Friendbot HTTP errors.
+
+**"use_friendbot is enabled but horizon_url is not a test network"**
+
+- Your `horizon_url` points to pubnet
 - Use `network: testnet` or set `horizon_url: https://horizon-testnet.stellar.org`
 
 **"Friendbot URL not on the allowlist"**
-- Only official Stellar friendbot endpoints are supported
+
+- Only official Stellar Friendbot endpoints are supported
 - Use `https://friendbot.stellar.org` or leave `friendbot_url` empty to use the default
 
 **"Friendbot returned HTTP 400: Account already exists"**
+
 - The account is already funded on testnet
-- This is not an error — validation proceeds normally
+- This is not an error. Validation proceeds normally
 
 **Friendbot times out**
-- Increase `friendbot_timeout_ms` (default 15000ms)
+
+- Increase `friendbot_timeout_ms` (default 15000ms, max 60000ms)
 - Check Stellar testnet status at https://status.stellar.org
+
+---
+
+## Network presets
+
+These are the official SDF defaults for each network. TrustBridge uses them for network inference (`inferStellarNetworkPreset` in `src/links.ts`), passphrase inference when `network_passphrase` is empty, and the Friendbot network guard.
+
+| Network | `horizon_url` | `network_passphrase` | Friendbot |
+| --- | --- | --- | --- |
+| pubnet (`public`) | `https://horizon.stellar.org` | `Public Global Stellar Network ; September 2015` | none (never called) |
+| testnet | `https://horizon-testnet.stellar.org` | `Test SDF Network ; September 2015` | `https://friendbot.stellar.org` |
+| futurenet | `https://horizon-futurenet.stellar.org` | `Test SDF Future Network ; October 2022` | `https://friendbot-futurenet.stellar.org` |
+
+All three Horizon hosts pass the `horizon_url` SSRF allowlist checks (`__tests__/ssrf_allowlist.test.ts`). The Friendbot hosts are on the Friendbot allowlist described in [Friendbot testnet funding](#friendbot-testnet-funding).
+
+**How the network is inferred from `horizon_url`:**
+
+- A URL containing `futurenet` is classified as **futurenet**.
+- A URL containing `testnet` is classified as **testnet**. This also works for custom mirrors such as `https://horizon-testnet.example.com`.
+- Anything else is classified as **pubnet**. For a self-hosted mirror whose hostname does not name its network, set `network_passphrase` explicitly so passphrase validation checks the right network.
+
+**Input examples per network:**
+
+```yaml
+# pubnet
+with:
+  horizon_url: https://horizon.stellar.org
+  network_passphrase: 'Public Global Stellar Network ; September 2015'
+
+# testnet
+with:
+  horizon_url: https://horizon-testnet.stellar.org
+  network_passphrase: 'Test SDF Network ; September 2015'
+  use_friendbot: true
+  friendbot_url: https://friendbot.stellar.org
+
+# futurenet
+with:
+  horizon_url: https://horizon-futurenet.stellar.org
+  network_passphrase: 'Test SDF Future Network ; October 2022'
+  use_friendbot: true
+  friendbot_url: https://friendbot-futurenet.stellar.org
+```
+
+> **Don't mix networks.** `horizon_url`, `network_passphrase`, `friendbot_url`, `asset_issuer` and any fallback URLs must all belong to the same network. A G-address is valid on every network, so a mismatch can quietly validate the wrong ledger. A passphrase that doesn't match the Horizon's network is reported as a [network passphrase mismatch](#network-passphrase-mismatch-detection-issue-2). A `horizon_url_fallback` / `rpc_fallback_url` on a different preset network than `horizon_url` (for example testnet primary with a futurenet fallback) is skipped unless `allow_cross_network_fallback: true`.
+
+**Self-hosted mirrors and GHES:** private Horizon mirrors and GitHub Enterprise Server runners behind egress proxies often use hostnames that differ from the official presets. See [GHES_COMPATIBILITY.md](GHES_COMPATIBILITY.md) for proxy and allowlist considerations, and set `network_passphrase` explicitly for any mirror whose hostname doesn't name its network.
+
+**Offline runs:** fixture / offline modes don't contact Horizon or Friendbot. Use the official preset URL for the network you are simulating (for example `https://horizon-testnet.stellar.org`) as a placeholder `horizon_url`, so network inference and comment links still match that network.
 
 ---
 

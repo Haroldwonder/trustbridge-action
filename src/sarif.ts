@@ -12,6 +12,8 @@
  * not blocked.
  */
 
+import type { HomeDomainCheckMode, HomeDomainOutcome, ValidationResult } from './checks';
+
 export const SARIF_SCHEMA =
   'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json';
 export const SARIF_VERSION = '2.1.0';
@@ -56,6 +58,22 @@ export interface SarifRule {
   name: string;
   shortDescription: SarifMessage;
   helpUri?: string;
+  /** Rich help shown by Code Scanning; `markdown` is rendered when present. */
+  help?: { text: string; markdown?: string };
+}
+
+/** Stable SARIF rule id for the SEP-0001 home domain check (Issue #708). */
+export const HOME_DOMAIN_RULE_ID = 'TB004';
+
+export const HOME_DOMAIN_HELP_URI =
+  'https://github.com/Stellar-TrustBridge/trustbridge-action/blob/main/docs/SEP0001_HOME_DOMAIN.md';
+
+/** Home domain check outcome carried into SARIF when the check is enabled. */
+export interface SarifHomeDomainOutcome {
+  outcome: HomeDomainOutcome;
+  mode: HomeDomainCheckMode;
+  actualHomeDomain?: string;
+  expectedHomeDomain?: string;
 }
 
 export interface SarifDocument {
@@ -77,6 +95,11 @@ export interface TrustBridgeCheckOutcome {
   xlmReserveMet: boolean;
   /** Asset code being checked (e.g. "USDC"). */
   assetCode: string;
+  /**
+   * SEP-0001 home domain outcome (Issue #708). Present only when
+   * `home_domain_check_enabled` is true; adds rule TB004 to the report.
+   */
+  homeDomain?: SarifHomeDomainOutcome;
 }
 
 /**
@@ -89,6 +112,9 @@ export interface TrustBridgeCheckOutcome {
  *
  * Each failing gate becomes a SARIF result at level "error"; passing gates
  * are emitted at level "none" so the run is always present in the report.
+ *
+ * When `outcome.homeDomain` is set, a fourth rule is emitted:
+ *  - TB004  home-domain-aligned (error in strict mode, warning in warn mode)
  */
 export function buildSarifDocument(outcome: TrustBridgeCheckOutcome): SarifDocument {
   const rules: SarifRule[] = [
@@ -144,6 +170,11 @@ export function buildSarifDocument(outcome: TrustBridgeCheckOutcome): SarifDocum
     message: { text: message },
   }));
 
+  if (outcome.homeDomain && outcome.homeDomain.outcome !== 'skipped') {
+    rules.push(buildHomeDomainRule());
+    results.push(buildHomeDomainResult(outcome.homeDomain));
+  }
+
   return {
     $schema: SARIF_SCHEMA,
     version: SARIF_VERSION,
@@ -160,6 +191,78 @@ export function buildSarifDocument(outcome: TrustBridgeCheckOutcome): SarifDocum
         results,
       },
     ],
+  };
+}
+
+function buildHomeDomainRule(): SarifRule {
+  return {
+    id: HOME_DOMAIN_RULE_ID,
+    name: 'HomeDomainAligned',
+    shortDescription: {
+      text: 'Asset issuer must publish the expected SEP-0001 home_domain on-chain.',
+    },
+    helpUri: HOME_DOMAIN_HELP_URI,
+    help: {
+      text:
+        'The asset issuer account home_domain is checked against expected_home_domain. ' +
+        'In strict mode a missing or mismatched domain fails validation; in warn mode it is reported only.',
+      markdown:
+        'The asset issuer account `home_domain` is checked against `expected_home_domain` ' +
+        '([SEP-0001](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0001.md)).\n\n' +
+        '- `home_domain_check_mode: strict`: a missing or mismatched domain fails validation ' +
+        '(`HOME_DOMAIN_MISSING` / `HOME_DOMAIN_MISMATCH`).\n' +
+        '- `home_domain_check_mode: warn`: the problem is reported as a warning only.\n\n' +
+        `See [SEP0001_HOME_DOMAIN.md](${HOME_DOMAIN_HELP_URI}) for configuration.`,
+    },
+  };
+}
+
+function buildHomeDomainResult(homeDomain: SarifHomeDomainOutcome): SarifResult {
+  if (homeDomain.outcome === 'valid') {
+    return {
+      ruleId: HOME_DOMAIN_RULE_ID,
+      level: 'none',
+      message: { text: `Issuer home_domain is ${homeDomain.actualHomeDomain ?? 'set'}.` },
+    };
+  }
+  const level: SarifLevel = homeDomain.mode === 'strict' ? 'error' : 'warning';
+  const text =
+    homeDomain.outcome === 'mismatch'
+      ? `Issuer home_domain is ${homeDomain.actualHomeDomain ?? ''} but ${homeDomain.expectedHomeDomain ?? ''} was expected.`
+      : 'Issuer account has no home_domain set on-chain (or the issuer account was unavailable).';
+  return { ruleId: HOME_DOMAIN_RULE_ID, level, message: { text } };
+}
+
+/**
+ * Build a SARIF outcome from a `ValidationResult` (Issue #708), so callers
+ * don't have to re-derive each gate. `homeDomainCheckMode` is only needed
+ * when the home domain check ran.
+ */
+export function sarifOutcomeFromResult(
+  result: ValidationResult,
+  context: {
+    horizonUrl: string;
+    stellarAddress: string;
+    assetCode: string;
+    homeDomainCheckMode?: HomeDomainCheckMode;
+  },
+): TrustBridgeCheckOutcome {
+  const homeDomainCheck = result.homeDomainCheck;
+  return {
+    horizonUrl: context.horizonUrl,
+    stellarAddress: context.stellarAddress,
+    accountFunded: result.accountFunded,
+    trustlineExists: result.trustlineExists,
+    xlmReserveMet: result.xlmReserveMet,
+    assetCode: context.assetCode,
+    homeDomain: homeDomainCheck
+      ? {
+          outcome: homeDomainCheck.outcome,
+          mode: context.homeDomainCheckMode ?? 'warn',
+          actualHomeDomain: homeDomainCheck.actualHomeDomain,
+          expectedHomeDomain: homeDomainCheck.expectedHomeDomain,
+        }
+      : undefined,
   };
 }
 
