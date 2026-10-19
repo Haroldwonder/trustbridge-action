@@ -123,6 +123,8 @@ With this configuration:
 - Requests to `horizon.stellar.org` go through the corporate proxy.
 - Any internal Horizon mirror at `*.corp.internal` also bypasses the proxy.
 
+An internal mirror's hostname usually doesn't match the official network presets (`horizon.stellar.org`, `horizon-testnet.stellar.org`, `horizon-futurenet.stellar.org`). TrustBridge then infers **pubnet** unless the hostname contains `testnet` or `futurenet`. Set `network_passphrase` explicitly for such mirrors. See [USAGE.md — Network presets](USAGE.md#network-presets).
+
 ### Invalid proxy URL soft-fail
 
 If `HTTPS_PROXY` / `HTTP_PROXY` contains a malformed URL, TrustBridge logs a warning and falls back to a **direct connection** rather than hard-failing the run. The action continues to operate without a proxy agent; an operator alert is emitted so the configuration issue can be corrected without breaking CI.

@@ -1,6 +1,9 @@
 import * as core from '@actions/core';
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   CheckConfig,
+  HomeDomainCheckMode,
   horizonFailureResult,
   parseMinXlmReserve,
   runAccountChecks,
@@ -9,8 +12,16 @@ import {
   validateStellarAddress,
   rateBudgetExhaustedResult,
 } from './checks';
-import { fetchAccount, getAssetBalance, HorizonError, waitForFundedAccount } from './horizon';
-import { formatCommentBody, resolvePostingMode, upsertIssueComment } from './comment';
+import {
+  callFriendbot,
+  fetchAccount,
+  fetchHomeDomainIssuerAccount,
+  getAssetBalance,
+  HorizonError,
+  isTestnetHorizon,
+  waitForFundedAccount,
+} from './horizon';
+import { formatCommentBody, postIssueComment } from './comment';
 import { normalizeAssetConfig, parseAssetsJson, dedupeAssets } from './assets';
 import { getErrorMessage, parseBooleanInput, parseNumberInput } from './inputs';
 import { formatFailureSummary } from './summary';
@@ -20,7 +31,7 @@ import { globalMetrics, writeJobSummary, globalHorizonHistogram } from './metric
 import { validateContractAddress, clearSpans, getSpans } from './validation';
 import { readTrustbridgeConfig } from './configReader';
 import { RateBudgetTracker, RateBudgetExhaustedError } from './resilience';
-import { buildSarifOutput, writeSarifFile, SarifValidationError } from './sarif';
+import { buildSarifDocument, sarifOutcomeFromResult, serialiseSarif } from './sarif';
 
 async function run(): Promise<void> {
   const jobController = new AbortController();
@@ -76,6 +87,24 @@ async function run(): Promise<void> {
   const useCache = parseBooleanInput(core.getInput('use_cache'), false);
   const logInputs = parseBooleanInput(core.getInput('log_inputs'), false);
   const trustbridgeConfigPath = core.getInput('trustbridge_config_path') || '.trustbridge.yml';
+  const sarifOutputPath = (core.getInput('sarif_output_path') || '').trim();
+
+  // Friendbot testnet onboarding (Issue #4 / #699). See docs/USAGE.md#friendbot-testnet-funding.
+  const useFriendbot = parseBooleanInput(core.getInput('use_friendbot'), false);
+  const friendbotUrl = core.getInput('friendbot_url') || 'https://friendbot.stellar.org';
+  const friendbotTimeoutMs = parseNumberInput(core.getInput('friendbot_timeout_ms'), 15000, {
+    min: 1000,
+    max: 60000,
+  });
+  let friendbotCalled = false;
+  let friendbotSuccess = false;
+  let friendbotTransactionHash = '';
+
+  // SEP-0001 home domain check (Issue #708). See docs/SEP0001_HOME_DOMAIN.md.
+  const homeDomainCheckEnabled = parseBooleanInput(core.getInput('home_domain_check_enabled'), false);
+  const expectedHomeDomain = (core.getInput('expected_home_domain') || '').trim() || undefined;
+  const homeDomainCheckMode: HomeDomainCheckMode =
+    (core.getInput('home_domain_check_mode') || '').trim().toLowerCase() === 'strict' ? 'strict' : 'warn';
   const sarifOutputPath = (core.getInput('sarif_output_path') || '').trim();
 
   // Create RateBudgetTracker if horizon_max_requests > 0
@@ -182,6 +211,9 @@ async function run(): Promise<void> {
     ...normalizedAsset,
     minXlmReserve,
     horizonUrl,
+    homeDomainCheckEnabled,
+    expectedHomeDomain,
+    homeDomainCheckMode,
   };
 
   core.info(`Checking Stellar account ${stellarAddress} via ${horizonUrl}`);
@@ -227,7 +259,11 @@ async function run(): Promise<void> {
           (hUrl, sAddr, opts) => fetchAccount(hUrl, sAddr, { ...horizonOptions, ...opts }),
         )
       : await fetchAccount(horizonUrl, stellarAddress, horizonOptions);
-    result = runAccountChecks(account, checkConfig);
+    // The home domain lives on the issuer account, not the contributor's.
+    const issuerAccount = homeDomainCheckEnabled
+      ? await fetchHomeDomainIssuerAccount(horizonUrl, normalizedAsset.assetIssuer, horizonOptions)
+      : undefined;
+    result = runAccountChecks(account, checkConfig, issuerAccount);
 
     // Issue #536 — extra trustlines from assets_json gate the ready output.
     // runAccountChecks only validates the single primary asset_code/asset_issuer
@@ -279,6 +315,46 @@ async function run(): Promise<void> {
       result = horizonFailureResult('Funding poll cancelled', checkConfig);
     } else if (error instanceof HorizonError && error.statusCode === 404) {
       result = unfundedAccountResult(stellarAddress, checkConfig);
+      if (useFriendbot && !isTestnetHorizon(horizonUrl)) {
+        // Pubnet guard: never request Friendbot funding against a public
+        // network Horizon, so friendbot_called stays false.
+        core.warning('use_friendbot is enabled but horizon_url is not a test network — Friendbot was not called.');
+      } else if (useFriendbot && !friendbotCalled) {
+        // Guarded so a single run never issues more than one funding request.
+        friendbotCalled = true;
+        logger.info('Account 404 encountered and use_friendbot enabled — calling Friendbot', {
+          component: 'index',
+          stellarAddress,
+          friendbotUrl,
+        });
+        const fbResult = await callFriendbot(
+          stellarAddress,
+          { friendbotUrl, timeoutMs: friendbotTimeoutMs },
+          horizonUrl,
+        );
+        friendbotSuccess = fbResult.success;
+        friendbotTransactionHash = fbResult.transactionHash ?? '';
+        if (fbResult.success) {
+          logger.info('Friendbot funding succeeded — re-fetching account', {
+            component: 'index',
+            transactionHash: friendbotTransactionHash,
+          });
+          try {
+            const fundedAccount = await fetchAccount(horizonUrl, stellarAddress, horizonOptions);
+            const issuerAccount = homeDomainCheckEnabled
+              ? await fetchHomeDomainIssuerAccount(horizonUrl, normalizedAsset.assetIssuer, horizonOptions)
+              : undefined;
+            result = runAccountChecks(fundedAccount, checkConfig, issuerAccount);
+          } catch (refetchErr) {
+            logger.warn('Failed to re-fetch account after Friendbot funding', {
+              component: 'index',
+              error: getErrorMessage(refetchErr),
+            });
+          }
+        } else {
+          logger.warn(`Friendbot funding failed: ${fbResult.message}`, { component: 'index' });
+        }
+      }
     } else if (error instanceof HorizonError) {
       core.error(error.message);
       result = horizonFailureResult(error.message, checkConfig);
@@ -294,6 +370,9 @@ async function run(): Promise<void> {
     assetCode: normalizedAsset.assetCode,
     assetIssuer: normalizedAsset.assetIssuer,
     assetsTrustlineStatus: assetsTrustlineStatusExtras,
+    friendbotCalled,
+    friendbotSuccess,
+    friendbotTransactionHash,
   });
 
   const commentBody = formatCommentBody(result, {
@@ -336,34 +415,20 @@ async function run(): Promise<void> {
     assetCode: normalizedAsset.assetCode,
     assetIssuer: normalizedAsset.assetIssuer,
     assetsTrustlineStatus: assetsTrustlineStatusExtras,
-    commentId,
+    friendbotCalled,
+    friendbotSuccess,
+    friendbotTransactionHash,
   });
 
-  // Issue #679 — SARIF output for GitHub Advanced Security. The document is
-  // validated against the vendored SARIF 2.1.0 schema before it is written,
-  // so a malformed file never reaches upload-sarif and the failure is
-  // attributed to TrustBridge rather than to the code scanning platform.
+  // SARIF 2.1.0 output (Issue #197). Includes rule TB004 for the home domain
+  // check when home_domain_check_enabled is true (Issue #708).
   if (sarifOutputPath) {
-    try {
-      const sarif = buildSarifOutput(
-        result,
-        normalizedAsset.assetCode,
-        horizonUrl,
-        stellarAddress,
-      );
-      const sarifFile = writeSarifFile(sarif, sarifOutputPath);
-      core.info(`SARIF report written to ${sarifFile}`);
-    } catch (sarifError) {
-      if (sarifError instanceof SarifValidationError) {
-        core.error(
-          `TrustBridge generated SARIF that does not conform to the SARIF 2.1.0 schema, so ${sarifOutputPath} was not written. ` +
-            `This is a TrustBridge bug, not a problem with the checked account. Violations:\n  ${sarifError.violations.join('\n  ')}`,
-        );
-        core.setFailed('SARIF output failed SARIF 2.1.0 schema validation — see the error above.');
-      } else {
-        core.setFailed(`Failed to write SARIF output to ${sarifOutputPath}: ${getErrorMessage(sarifError)}`);
-      }
-    }
+    writeSarifOutput(sarifOutputPath, result, {
+      horizonUrl,
+      stellarAddress,
+      assetCode: normalizedAsset.assetCode,
+      homeDomainCheckMode,
+    });
   }
 
   if (debugMode) {
@@ -393,6 +458,30 @@ async function run(): Promise<void> {
     core.setFailed(failureMessage);
   } else {
     core.warning(failureMessage);
+  }
+}
+
+function writeSarifOutput(
+  sarifOutputPath: string,
+  result: Parameters<typeof sarifOutcomeFromResult>[0],
+  context: Parameters<typeof sarifOutcomeFromResult>[1],
+): void {
+  const workspaceRoot = path.normalize(process.env.GITHUB_WORKSPACE || process.cwd());
+  const resolved = path.normalize(
+    path.isAbsolute(sarifOutputPath) ? sarifOutputPath : path.join(workspaceRoot, sarifOutputPath),
+  );
+  // Path traversal guard: SARIF is only ever written inside the workspace.
+  if (!resolved.startsWith(workspaceRoot + path.sep)) {
+    core.warning('sarif_output_path resolves outside GITHUB_WORKSPACE — SARIF output skipped.');
+    return;
+  }
+  try {
+    const sarifJson = serialiseSarif(buildSarifDocument(sarifOutcomeFromResult(result, context)));
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    fs.writeFileSync(resolved, sarifJson, 'utf8');
+    core.info(`Wrote SARIF 2.1.0 output to ${resolved}`);
+  } catch (sarifError) {
+    core.warning(`Failed to write SARIF output (non-fatal): ${getErrorMessage(sarifError)}`);
   }
 }
 

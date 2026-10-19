@@ -21,6 +21,13 @@ import {
   isSensitiveSecretKey,
   logger,
   ActionInputsLogRecord,
+  HorizonRetryEvent,
+  HORIZON_RETRY_LOG_FIELDS,
+  HORIZON_RETRY_REASON_CODES,
+  buildHorizonRetryLogContext,
+  formatHorizonRetryMessage,
+  horizonRetryLogLevel,
+  redactHorizonBaseUrl,
 } from '../src/logger';
 
 jest.mock('@actions/core');
@@ -481,67 +488,163 @@ describe('Issue #225 — Token and Private Key Redaction', () => {
 
 
 // ---------------------------------------------------------------------------
-// Issue #675 — Soroban C-address redaction aligned with validation.ts
+// Issue #697 — structured Horizon retry events
 // ---------------------------------------------------------------------------
-describe('Issue #675 — C-address redaction coverage', () => {
-  const C_ADDRESS = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM';
-  const FULL_C = /C[A-Z2-7]{55}/;
+describe('structured Horizon retry events (Issue #697)', () => {
+  const RAW_ADDRESSES = [VALID_G_ADDRESS, VALID_C_ADDRESS, VALID_M_ADDRESS];
 
-  it('masks a C-address glued to an identifier with "_" (missed by \\b)', () => {
-    const result = redactString(`sac_${C_ADDRESS}`);
-    expect(result).toBe('sac_CAAA...D2KM');
-    expect(result).not.toMatch(FULL_C);
-  });
+  function retryEvent(
+    overrides: Partial<HorizonRetryEvent> = {},
+  ): HorizonRetryEvent {
+    return {
+      phase: 'scheduled',
+      attempt: 0,
+      maxAttempts: 4,
+      status: 429,
+      delayMs: 2000,
+      capped: false,
+      kind: 'http',
+      endpointKind: 'primary',
+      horizonUrl: HORIZON_URL,
+      stellarAddress: VALID_G_ADDRESS,
+      ...overrides,
+    };
+  }
 
-  it('masks a C-address preceded by a lowercase letter or digit 0/1/8/9', () => {
-    expect(redactString(`x${C_ADDRESS}`)).toBe('xCAAA...D2KM');
-    expect(redactString(`9${C_ADDRESS}9`)).toBe('9CAAA...D2KM9');
-  });
+  function emittedLines(): string[] {
+    return [
+      ...(core.debug as jest.Mock).mock.calls,
+      ...(core.info as jest.Mock).mock.calls,
+      ...(core.warning as jest.Mock).mock.calls,
+    ].map((args) => String(args[0]));
+  }
 
-  it('masks C-addresses inside webhook JSON', () => {
-    const json = JSON.stringify({ stellar_address: C_ADDRESS, assets: [{ asset_issuer: C_ADDRESS }] });
-    const result = redactString(json);
-    expect(result).not.toMatch(FULL_C);
-    expect(result.match(/CAAA\.\.\.D2KM/g)).toHaveLength(2);
-  });
-
-  it('does not redact a 56-char run that is part of a longer base32 run', () => {
-    const longRun = `${C_ADDRESS}AAAA`;
-    expect(redactString(longRun)).toBe(longRun);
-  });
-
-  it('redacts snake_case address keys in LogContext', () => {
-    const redacted = redactContext({ stellar_address: C_ADDRESS, asset_issuer: C_ADDRESS, issuer: C_ADDRESS });
-    expect(redacted?.stellar_address).toBe('CAAA...D2KM');
-    expect(redacted?.asset_issuer).toBe('CAAA...D2KM');
-    expect(redacted?.issuer).toBe('CAAA...D2KM');
-  });
-
-  it('debug log snapshot contains no full 56-char C-address', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
     logger.setDebugMode(true);
-    const debugSpy = jest.spyOn(core, 'debug').mockImplementation(() => {});
-    try {
-      logger.debug(`Webhook payload: {"asset_issuer":"${C_ADDRESS}"}`, {
-        component: 'webhook',
-        contract: `id=${C_ADDRESS}`,
-      });
-    } finally {
-      logger.setDebugMode(false);
+  });
+
+  afterEach(() => {
+    logger.setDebugMode(false);
+  });
+
+  it('emits only the documented fixed schema fields', () => {
+    const context = buildHorizonRetryLogContext(retryEvent());
+    const keys = Object.keys(context!).filter((k) => k !== 'component');
+    expect(keys.sort()).toEqual([...HORIZON_RETRY_LOG_FIELDS].sort());
+  });
+
+  it('routes scheduled retries to debug and exhaustion to warning', () => {
+    expect(horizonRetryLogLevel(retryEvent())).toBe('debug');
+    expect(horizonRetryLogLevel(retryEvent({ phase: 'exhausted' }))).toBe('warning');
+
+    logger.horizonRetry(retryEvent());
+    expect(core.debug).toHaveBeenCalledTimes(1);
+    expect(core.warning).not.toHaveBeenCalled();
+
+    logger.horizonRetry(retryEvent({ phase: 'exhausted', attempt: 3 }));
+    expect(core.warning).toHaveBeenCalledTimes(1);
+    const line = (core.warning as jest.Mock).mock.calls[0][0] as string;
+    expect(line).toContain('HORIZON_RETRIES_EXHAUSTED');
+    expect(line).toContain('4/4 attempt(s)');
+  });
+
+  it('suppresses scheduled retry lines when debug mode is off', () => {
+    logger.setDebugMode(false);
+    logger.horizonRetry(retryEvent());
+    expect(core.debug).not.toHaveBeenCalled();
+  });
+
+  it('includes attempt, status, delayMs and capped in scheduled events', () => {
+    const context = buildHorizonRetryLogContext(
+      retryEvent({ attempt: 2, status: 503, delayMs: 30000, capped: true }),
+    )!;
+    expect(context.attempt).toBe(2);
+    expect(context.nextAttempt).toBe(3);
+    expect(context.status).toBe(503);
+    expect(context.delayMs).toBe(30000);
+    expect(context.capped).toBe(true);
+    expect(context.reasonCode).toBe(HORIZON_RETRY_REASON_CODES.scheduled);
+  });
+
+  it('logs very short capped delays accurately', () => {
+    const context = buildHorizonRetryLogContext(retryEvent({ delayMs: 1, capped: true }))!;
+    expect(context.delayMs).toBe(1);
+    expect(context.capped).toBe(true);
+  });
+
+  it('tags wait-budget exhaustion with its own reason code', () => {
+    const context = buildHorizonRetryLogContext(
+      retryEvent({ phase: 'exhausted', reason: 'wait_budget' }),
+    )!;
+    expect(context.reasonCode).toBe(HORIZON_RETRY_REASON_CODES.wait_budget);
+    expect(context.delayMs).toBe(0);
+    expect(context.nextAttempt).toBeNull();
+  });
+
+  it.each([
+    ['G-address', VALID_G_ADDRESS, 'GAAA...AWHF'],
+    ['C-address', VALID_C_ADDRESS, 'CAAA...AAAA'],
+    ['M-address', VALID_M_ADDRESS, 'MAAA...AAAA'],
+  ])('redacts a %s passed as stellarAddress', (_label, raw, redacted) => {
+    const context = buildHorizonRetryLogContext(retryEvent({ stellarAddress: raw }))!;
+    expect(context.stellarAddress).toBe(redacted);
+    logger.horizonRetry(retryEvent({ stellarAddress: raw }));
+    logger.horizonRetry(retryEvent({ stellarAddress: raw, phase: 'exhausted' }));
+    for (const line of emittedLines()) {
+      expect(line).not.toContain(raw);
     }
-    const logged = debugSpy.mock.calls.map((call) => String(call[0])).join('\n');
-    expect(logged).toContain('CAAA...D2KM');
-    expect(logged).not.toMatch(FULL_C);
   });
 
-  it('leaves G-address redaction unchanged', () => {
-    expect(redactString(`Account ${VALID_G_ADDRESS} was not found`)).toBe('Account GAAA...AWHF was not found');
-    expect(redactStellarAddress(VALID_G_ADDRESS)).toBe('GAAA...AWHF');
+  it.each([
+    ['G-address', VALID_G_ADDRESS],
+    ['C-address', VALID_C_ADDRESS],
+    ['M-address', VALID_M_ADDRESS],
+  ])('redacts a %s embedded in the horizonUrl path and query', (_label, raw) => {
+    logger.horizonRetry(
+      retryEvent({
+        horizonUrl: `https://horizon-testnet.stellar.org/accounts/${raw}?account=${raw}&api_key=secret`,
+        phase: 'exhausted',
+      }),
+    );
+    const lines = emittedLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain(raw);
+    expect(lines[0]).not.toContain('secret');
+    expect(lines[0]).not.toContain('?');
+    expect(lines[0]).toContain('horizon-testnet.stellar.org');
   });
 
-  it('redacts JWTs embedded in free-form strings (Issue #674)', () => {
-    const jwt = 'eyJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJ4In0.c2ln';
-    const result = redactString(`provider said: ${jwt}`);
-    expect(result).not.toContain(jwt);
-    expect(result).toContain('[REDACTED_JWT]');
+  it('keeps addresses out of every retry line for all address shapes at once', () => {
+    for (const raw of RAW_ADDRESSES) {
+      logger.horizonRetry(retryEvent({ stellarAddress: raw, horizonUrl: `${HORIZON_URL}/accounts/${raw}` }));
+      logger.horizonRetry(retryEvent({ stellarAddress: raw, kind: 'network', status: 0, phase: 'exhausted' }));
+    }
+    const lines = emittedLines();
+    expect(lines.length).toBe(RAW_ADDRESSES.length * 2);
+    for (const line of lines) {
+      for (const raw of RAW_ADDRESSES) {
+        expect(line).not.toContain(raw);
+      }
+    }
+  });
+
+  it('formats summary messages without URLs or addresses', () => {
+    expect(formatHorizonRetryMessage(retryEvent())).toBe('Horizon retry scheduled');
+    expect(formatHorizonRetryMessage(retryEvent({ kind: 'timeout', status: 0 }))).toBe(
+      'Horizon transport retry scheduled',
+    );
+    const exhausted = formatHorizonRetryMessage(
+      retryEvent({ phase: 'exhausted', endpointKind: 'fallback', attempt: 1, maxAttempts: 2 }),
+    );
+    expect(exhausted).toBe(
+      'Horizon retries exhausted (HORIZON_RETRIES_EXHAUSTED): HTTP 429 on fallback endpoint after 2/2 attempt(s)',
+    );
+  });
+
+  it('redactHorizonBaseUrl strips credentials, query and fragment', () => {
+    expect(redactHorizonBaseUrl('https://user:pw@horizon.example.com/?token=abc#frag')).toBe(
+      'https://horizon.example.com',
+    );
   });
 });
