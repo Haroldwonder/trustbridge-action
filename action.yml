@@ -151,9 +151,22 @@ inputs:
     required: false
     default: "0"
   retry_max_delay_ms:
-    description: "Maximum backoff delay in milliseconds for Horizon retries"
+    description: >-
+      Maximum delay in milliseconds for any single Horizon retry sleep. Caps
+      both server-supplied Retry-After values on HTTP 429/503 and exponential
+      backoff (retry_base_delay_ms * 2^attempt). "0" disables sleeping between
+      retries while still honoring max_retries. Default 30000.
     required: false
     default: "30000"
+  retry_max_total_wait_ms:
+    description: >-
+      Total retry sleep budget in milliseconds per Horizon endpoint. When the
+      next (already capped) sleep would push the cumulative wait past this
+      value, retries stop and the run fails with RATE_LIMIT_EXHAUSTED instead
+      of sleeping. See docs/ERROR_HANDLING.md for the worst-case formula.
+      Default 120000.
+    required: false
+    default: "120000"
   use_cache:
     description: "Cache successful Horizon responses in job memory (true/false)"
     required: false
@@ -483,7 +496,8 @@ inputs:
   stellar_toml_cache_ttl_ms:
     description: >-
       Time-to-live for stellar.toml fetch cache in milliseconds. Default 3600000
-      (1 hour). Only used when stellar_toml_fetch_enabled is true.
+      (1 hour); "0" disables caching; values are capped at 86400000 (24 hours).
+      Only used when stellar_toml_fetch_enabled is true.
     required: false
     default: "3600000"
   stellar_toml_hash_pin:

@@ -102,6 +102,32 @@ describe('SimpleCache', () => {
     const cache = new SimpleCache({ useActionsCacheBackend: true });
     expect(cache.getStats().backendEnabled).toBe(true);
   });
+
+  // Issue #709: stellar.toml entries must be evictable when the hash pin no
+  // longer matches, so a poisoned/stale body is never served again.
+  it('delete() evicts a single key and leaves others intact', () => {
+    const cache = new SimpleCache();
+    cache.set('toml:anchor.example', { content: 'stale' }, 60_000);
+    cache.set('toml:other.example', { content: 'fresh' }, 60_000);
+
+    expect(cache.delete('toml:anchor.example')).toBe(true);
+    expect(cache.get('toml:anchor.example')).toBeNull();
+    expect(cache.get('toml:other.example')).toEqual({ content: 'fresh' });
+  });
+
+  it('delete() returns false for a missing key', () => {
+    const cache = new SimpleCache();
+    expect(cache.delete('toml:missing.example')).toBe(false);
+  });
+
+  it('serves a stellar.toml-style entry for exactly its TTL window', () => {
+    const cache = new SimpleCache();
+    cache.set('toml:anchor.example', { content: 'body' }, 3_600_000);
+    jest.advanceTimersByTime(3_599_999);
+    expect(cache.get('toml:anchor.example')).toEqual({ content: 'body' });
+    jest.advanceTimersByTime(2);
+    expect(cache.get('toml:anchor.example')).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

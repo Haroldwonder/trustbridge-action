@@ -131,10 +131,52 @@ Stellar accounts must receive a minimum XLM funding transaction before they exis
 
 Horizon may return `Retry-After`. The client:
 
-1. Waits for `Retry-After` or exponential backoff (1s, 2s, 4s) with a ±10% random jitter to prevent thundering herds.
-2. Enforces a sleep cap: `retry_max_delay_ms` (per retry) and `retry_max_total_wait_ms` (total across retries). If exceeded, throws a distinct rate limit error immediately.
-3. Retries up to **3** times
-4. If still failing → `horizonFailureResult`
+1. Waits for `Retry-After` (seconds or HTTP-date) when present, otherwise exponential backoff `retry_base_delay_ms × 2^attempt` (1s, 2s, 4s with defaults).
+2. Caps every individual sleep at `retry_max_delay_ms`, whatever the server asked for.
+3. Tracks the cumulative sleep per endpoint and stops retrying when the next sleep would push it past `retry_max_total_wait_ms`, throwing `HorizonRateLimitError` (`RATE_LIMIT_EXHAUSTED`) immediately instead of sleeping.
+4. Retries up to `max_retries` times (default **3**).
+5. If still failing → `horizonFailureResult`
+
+#### Retry-After cap inputs (Issue #705)
+
+| Input | Default | Bounds (parsed in `src/index.ts`) | Effect |
+|-------|---------|------------------------------------|--------|
+| `max_retries` | `3` | 0 – 10 | Retry attempts after the first request, per endpoint. |
+| `retry_base_delay_ms` | `1000` | 0 – 60000 | Base for exponential backoff when `Retry-After` is missing or invalid. |
+| `retry_max_delay_ms` | `30000` | 0 – 300000 | Hard cap on **any single** sleep (Retry-After *and* backoff). `0` disables sleeping but `max_retries` still applies. |
+| `retry_max_total_wait_ms` | `120000` | 0 – 600000 | Budget for the **sum** of sleeps on one endpoint. Exceeding it aborts with `RATE_LIMIT_EXHAUSTED`. |
+
+These inputs are mirrored in `schemas/action-inputs.schema.json`.
+
+**How the cap is applied** (`fetchAccountOnce` in `src/horizon.ts`):
+
+```text
+sleep_n   = min(RetryAfter_n ?? retry_base_delay_ms × 2^n, retry_max_delay_ms)
+if total + sleep_n > retry_max_total_wait_ms → throw RATE_LIMIT_EXHAUSTED (no sleep)
+total    += sleep_n
+```
+
+- A `Retry-After` value that is negative, non-numeric and not an HTTP-date, or non-finite (e.g. `1e400`) is treated as missing, so backoff applies.
+- When a `Retry-After` value is capped, an info line is logged with the parsed millisecond values only (`requested 86400000ms exceeds retry_max_delay_ms (30000ms)`); the raw header string is never logged.
+- Workflow cancellation (`SIGINT`/`SIGTERM` → `AbortSignal`) wakes a pending sleep at once and the loop exits before the next request.
+
+**Worst-case wait per endpoint:**
+
+```text
+min(max_retries × retry_max_delay_ms, retry_max_total_wait_ms)
+```
+
+The primary and the fallback endpoint (`horizon_url_fallback` / `rpc_fallback_url`) each have their own budget, so the worst case for a run with a fallback is twice that value, plus request time (`horizon_timeout_ms` × attempts).
+
+**Example timeline:** `max_retries: 3`, `retry_max_delay_ms: 30000`, `retry_max_total_wait_ms: 45000`. Horizon answers every request with `429` and `Retry-After: 3600`:
+
+| t (s) | Event | Sleep | Cumulative |
+|-------|-------|-------|------------|
+| 0 | Attempt 1 → 429, `Retry-After: 3600` (3,600,000 ms) | capped to 30,000 ms (logged) | 30,000 |
+| 30 | Attempt 2 → 429, `Retry-After: 3600` | next sleep would be 30,000 → total 60,000 > 45,000 | — |
+| 30 | `HorizonRateLimitError`: *Horizon retry wait budget exhausted (total wait 60000ms exceeds cap of 45000ms)* → `RATE_LIMIT_EXHAUSTED` | | |
+
+Without the cap, the same response would have stalled the job for an hour per retry.
 
 **Operator tip:** For high-volume orgs or mass assignments (Waves), consider configuring `horizon_max_requests` to cap the total requests per run. Once this budget is exhausted, the action will fail fast with a `RATE_BUDGET_EXHAUSTED` reason code (distinct from `ACCOUNT_NOT_FUNDED` and `HORIZON_ERROR`) rather than stampeding the public Horizon API. Consider self-hosted Horizon or caching for extremely high concurrency workflows.
 

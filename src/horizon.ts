@@ -1,12 +1,6 @@
 import { defaultCache, SimpleCache } from './cache';
-import { logger, redactHorizonUrl, redactStellarAddress, redactString, LogContext } from './logger';
-import { inferStellarNetworkPreset } from './links';
-import { globalMetrics } from './metrics';
-import { RateBudgetTracker, CircuitBreaker, CircuitOpenError } from './resilience';
-import { validateHorizonUrl } from './validation';
-import { traceHorizonFetch } from './tracing';
-import { createProxiedFetch } from './proxy';
-
+import { logger, redactHorizonUrl, redactString, LogContext } from './logger';
+import { RateBudgetTracker, RateBudgetExhaustedError, CircuitBreaker } from './resilience';
 export interface HorizonBalanceNative {
   balance: string;
   asset_type: 'native';
@@ -178,50 +172,32 @@ export interface FetchAccountOptions {
    * immediately; no misleading "account not funded" result is produced.
    */
   signal?: AbortSignal;
-  horizonMaxRequests?: number;
+  /**
+   * Base delay for exponential backoff (`retry_base_delay_ms`). The n-th
+   * retry waits `retryBaseDelayMs * 2^n`, capped at `retryMaxDelayMs`.
+   */
   retryBaseDelayMs?: number;
+  /**
+   * Hard cap on any single retry sleep (`retry_max_delay_ms`), applied to
+   * both `Retry-After` values and exponential backoff. 0 disables sleeping
+   * between retries while still honoring `maxRetries`.
+   */
   retryMaxDelayMs?: number;
+  /**
+   * Cumulative sleep budget across all retries of one endpoint
+   * (`retry_max_total_wait_ms`). When the next sleep would exceed it the
+   * retry loop aborts with a `HorizonRateLimitError` (429) or the last
+   * transport error instead of sleeping.
+   */
   retryMaxTotalWaitMs?: number;
-  rateBudgetTracker?: RateBudgetTracker;
-  /**
-   * Optional circuit breaker for Horizon fetches (Issue #209).
-   * When the circuit is open, requests are fast-failed without reaching
-   * the network. Cache hits bypass the circuit breaker.
-   */
-  circuitBreaker?: CircuitBreaker;
-  /**
-   * By default, a fallback URL that resolves to a *different* Stellar
-   * network than the primary `horizon_url` (public vs testnet, inferred
-   * from the URL) is never used — a G-address is valid on every network,
-   * so a cross-network fallback can silently return funded/trustline/
-   * reserve data for the wrong ledger instead of failing loudly. Set this
-   * to `true` to opt into cross-network fallback anyway (e.g. deliberate
-   * multi-network setups).
-   */
-  allowCrossNetworkFallback?: boolean;
-  /**
-   * Alias for `allowCrossNetworkFallback` kept for older call sites / tests.
-   * Prefer `allowCrossNetworkFallback`.
-   */
-  allowCrossNetworkFailover?: boolean;
-  /** Optional secondary Horizon URL used for same-network failover. */
-  secondaryHorizonUrl?: string;
-  /**
-   * Optional SHA-256 certificate fingerprint to pin the Horizon TLS cert.
-   * When set, a pre-flight TLS probe is performed before the first fetch.
-   * Mismatch throws HorizonPinMismatchError immediately (not retried).
-   * Leave empty (default) to use standard WebPKI certificate validation only.
-   * (Issue #303)
-   */
-  pinFingerprint?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_DELAY_MS = 1_000;
 const DEFAULT_CACHE_TTL_MS = 60_000;
-const DEFAULT_RETRY_MAX_DELAY_MS = 30_000;
-const DEFAULT_RETRY_MAX_TOTAL_WAIT_MS = 120_000;
+export const DEFAULT_RETRY_MAX_DELAY_MS = 30_000;
+export const DEFAULT_RETRY_MAX_TOTAL_WAIT_MS = 120_000;
 
 export function normalizeHorizonUrl(baseUrl: string): string {
   const trimmed = baseUrl.trim();
@@ -275,7 +251,9 @@ export function parseRetryAfterMs(response: import('node-fetch').Response): numb
   }
   const seconds = Number(header);
   if (!Number.isNaN(seconds)) {
-    return seconds * 1000;
+    // Negative or non-finite values (e.g. "-5", "1e400") are treated as
+    // absent so the caller falls back to capped exponential backoff.
+    return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : null;
   }
   const date = Date.parse(header);
   if (!Number.isNaN(date)) {
@@ -402,14 +380,15 @@ async function fetchAccountOnce(
   stellarAddress: string,
   timeoutMs: number,
   maxRetries: number,
-  endpointKind: "primary" | "fallback",
-  retryMaxDelayMs: number,
-  retryMaxTotalWaitMs: number,
+  endpointKind: 'primary' | 'fallback',
+  retryMaxDelayMs: number = DEFAULT_RETRY_MAX_DELAY_MS,
+  retryMaxTotalWaitMs: number = DEFAULT_RETRY_MAX_TOTAL_WAIT_MS,
   parentSignal?: AbortSignal,
   rateBudgetTracker?: RateBudgetTracker,
   circuitBreaker?: CircuitBreaker,
   retryBaseDelayMs: number = DEFAULT_RETRY_BASE_DELAY_MS,
 ): Promise<FetchOnceResult> {
+  const externalSignal = parentSignal;
   const normalizedHorizonUrl = normalizeHorizonUrl(targetHorizonUrl);
   const url = `${normalizedHorizonUrl}/accounts/${stellarAddress}`;
   const safeUrlForLog = redactHorizonUrl(url);
@@ -546,7 +525,22 @@ async function fetchAccountOnce(
           let retryAfterCapped: boolean;
           if (retryAfterHeader !== null) {
             retryAfter = Math.min(retryAfterHeader, retryMaxDelayMs);
-            retryAfterCapped = retryAfterHeader > retryMaxDelayMs;
+            if (retryAfterHeader > retryMaxDelayMs) {
+              // Issue #705: surface the cap. Only the parsed millisecond
+              // values are logged, never the raw header string.
+              logger.info(
+                `Horizon Retry-After capped: requested ${Math.round(retryAfterHeader)}ms exceeds retry_max_delay_ms (${retryMaxDelayMs}ms); sleeping ${retryAfter}ms.`,
+                safeHorizonContext({
+                  component: "horizon",
+                  horizonUrl: targetHorizonUrl,
+                  endpointKind,
+                  status: response.status,
+                  attempt,
+                  retryAfterRequestedMs: Math.round(retryAfterHeader),
+                  retryMaxDelayMs,
+                }),
+              );
+            }
           } else {
             retryAfter = Math.min(
               retryBaseDelayMs * 2 ** attempt,
@@ -578,20 +572,27 @@ async function fetchAccountOnce(
 
           totalWaitMs += retryAfter;
 
-          logger.horizonRetry({
-            phase: "scheduled",
-            attempt,
-            maxAttempts: maxRetries + 1,
-            status: response.status,
-            delayMs: retryAfter,
-            capped: retryAfterCapped,
-            kind: "http",
-            endpointKind,
-            horizonUrl: normalizedHorizonUrl,
-            stellarAddress,
-            retryAfterFromHeader: retryAfterHeader !== null,
-          });
-          await cancellableSleep(retryAfter, parentSignal);
+          logger.debug(
+            "Horizon retry scheduled",
+            safeHorizonContext({
+              component: "horizon",
+              stellarAddress,
+              horizonUrl: targetHorizonUrl,
+              endpointKind,
+              status: response.status,
+              retryable,
+              latencyMs,
+              attempt,
+              retryAfterMs: retryAfter,
+              retryAfterFromHeader: retryAfterHeader !== null,
+              retryAfterCapped:
+                retryAfterHeader !== null && retryAfterHeader > retryMaxDelayMs,
+              nextAttempt: attempt + 1,
+            }),
+          );
+          if (retryAfter > 0) {
+            await cancellableSleep(retryAfter, parentSignal);
+          }
           // If the job was cancelled during the sleep, bail out on the next
           // iteration's pre-flight check rather than issuing another request.
           attempt += 1;
@@ -768,19 +769,23 @@ async function fetchAccountOnce(
 
         totalWaitMs += backoffMs;
 
-        logger.horizonRetry({
-          phase: "scheduled",
-          attempt,
-          maxAttempts: maxRetries + 1,
-          status: 0,
-          delayMs: backoffMs,
-          capped: backoffCapped,
-          kind: transportKind,
-          endpointKind,
-          horizonUrl: normalizedHorizonUrl,
-          stellarAddress,
-        });
-        await cancellableSleep(backoffMs, parentSignal);
+        logger.debug(
+          "Horizon transport retry scheduled",
+          safeHorizonContext({
+            component: "horizon",
+            stellarAddress,
+            horizonUrl: targetHorizonUrl,
+            endpointKind,
+            kind: isAbort ? "timeout" : "network",
+            latencyMs,
+            attempt,
+            retryAfterMs: backoffMs,
+            nextAttempt: attempt + 1,
+          }),
+        );
+        if (backoffMs > 0) {
+          await cancellableSleep(backoffMs, parentSignal);
+        }
         // If the job was cancelled during the backoff sleep, bail out on the
         // next iteration's pre-flight check rather than issuing another request.
         attempt += 1;

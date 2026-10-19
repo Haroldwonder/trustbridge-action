@@ -31,7 +31,7 @@ import { globalMetrics, writeJobSummary, globalHorizonHistogram } from './metric
 import { validateContractAddress, clearSpans, getSpans } from './validation';
 import { readTrustbridgeConfig } from './configReader';
 import { RateBudgetTracker, RateBudgetExhaustedError } from './resilience';
-import { buildSarifDocument, sarifOutcomeFromResult, serialiseSarif } from './sarif';
+import { runStellarTomlCheck, DEFAULT_STELLAR_TOML_CACHE_TTL_MS, MAX_STELLAR_TOML_CACHE_TTL_MS } from './toml';
 
 async function run(): Promise<void> {
   const jobController = new AbortController();
@@ -84,6 +84,36 @@ async function run(): Promise<void> {
   const horizonMaxRequests = parseNumberInput(core.getInput('horizon_max_requests'), 0, {
     min: 0,
   });
+  // Retry / Retry-After caps (Issue #705). Every sleep is min(Retry-After or
+  // backoff, retry_max_delay_ms); the cumulative sleep per endpoint is bounded
+  // by retry_max_total_wait_ms. See docs/ERROR_HANDLING.md.
+  const maxRetries = parseNumberInput(core.getInput('max_retries'), 3, { min: 0, max: 10 });
+  const retryBaseDelayMs = parseNumberInput(core.getInput('retry_base_delay_ms'), 1000, {
+    min: 0,
+    max: 60000,
+  });
+  const retryMaxDelayMs = parseNumberInput(core.getInput('retry_max_delay_ms'), 30000, {
+    min: 0,
+    max: 300000,
+  });
+  const retryMaxTotalWaitMs = parseNumberInput(core.getInput('retry_max_total_wait_ms'), 120000, {
+    min: 0,
+    max: 600000,
+  });
+
+  // SEP-0001 home domain + optional stellar.toml fetch (Issue #709).
+  const homeDomainCheckEnabled = parseBooleanInput(core.getInput('home_domain_check_enabled'), false);
+  const expectedHomeDomain = (core.getInput('expected_home_domain') || '').trim();
+  const homeDomainCheckMode =
+    (core.getInput('home_domain_check_mode') || '').trim().toLowerCase() === 'strict' ? 'strict' : 'warn';
+  const stellarTomlFetchEnabled = parseBooleanInput(core.getInput('stellar_toml_fetch_enabled'), false);
+  const stellarTomlCacheTtlMs = parseNumberInput(
+    core.getInput('stellar_toml_cache_ttl_ms'),
+    DEFAULT_STELLAR_TOML_CACHE_TTL_MS,
+    { min: 0, max: MAX_STELLAR_TOML_CACHE_TTL_MS },
+  );
+  const stellarTomlHashPin = (core.getInput('stellar_toml_hash_pin') || '').trim();
+
   const useCache = parseBooleanInput(core.getInput('use_cache'), false);
   const logInputs = parseBooleanInput(core.getInput('log_inputs'), false);
   const trustbridgeConfigPath = core.getInput('trustbridge_config_path') || '.trustbridge.yml';
@@ -161,6 +191,14 @@ async function run(): Promise<void> {
     rpcFallbackUrl: rpcFallbackUrlRaw,
     useCache,
     sep0007DeepLinks,
+    maxRetries,
+    retryBaseDelayMs,
+    retryMaxDelayMs,
+    retryMaxTotalWaitMs,
+    homeDomainCheckEnabled,
+    stellarTomlFetchEnabled,
+    stellarTomlCacheTtlMs,
+    stellarTomlHashPinSet: Boolean(stellarTomlHashPin),
   });
 
   if (logInputs) {
@@ -212,8 +250,11 @@ async function run(): Promise<void> {
     minXlmReserve,
     horizonUrl,
     homeDomainCheckEnabled,
-    expectedHomeDomain,
+    expectedHomeDomain: expectedHomeDomain || undefined,
     homeDomainCheckMode,
+    stellarTomlFetchEnabled,
+    stellarTomlCacheTtlMs,
+    stellarTomlHashPin: stellarTomlHashPin || undefined,
   };
 
   core.info(`Checking Stellar account ${stellarAddress} via ${horizonUrl}`);
@@ -237,6 +278,11 @@ async function run(): Promise<void> {
     cacheTtlMs: useCache ? horizonCacheTtlMs : 0,
     useCache,
     rateBudgetTracker,
+    maxRetries,
+    retryBaseDelayMs,
+    retryMaxDelayMs,
+    retryMaxTotalWaitMs,
+    signal: jobController.signal,
   };
 
   try {
@@ -264,6 +310,33 @@ async function run(): Promise<void> {
       ? await fetchHomeDomainIssuerAccount(horizonUrl, normalizedAsset.assetIssuer, horizonOptions)
       : undefined;
     result = runAccountChecks(account, checkConfig, issuerAccount);
+
+    // Issue #709 — optional stellar.toml fetch layered on top of the on-chain
+    // home_domain check. When stellar_toml_fetch_enabled is false the
+    // SSRF-guarded HTTP client is never called.
+    if (homeDomainCheckEnabled && stellarTomlFetchEnabled) {
+      const tomlDomain = expectedHomeDomain || result.homeDomainCheck?.actualHomeDomain;
+      const tomlOutcome = await runStellarTomlCheck(tomlDomain, {
+        enabled: stellarTomlFetchEnabled,
+        cacheTtlMs: stellarTomlCacheTtlMs,
+        hashPin: stellarTomlHashPin || undefined,
+      });
+      if (tomlOutcome.status !== 'skipped') {
+        // A pinned hash always fails closed; otherwise fetch errors only block
+        // in strict home_domain_check_mode.
+        const blocks =
+          tomlOutcome.status === 'failed' && (Boolean(stellarTomlHashPin) || homeDomainCheckMode === 'strict');
+        result.checks.push({
+          passed: !blocks,
+          label: 'SEP-0001 stellar.toml',
+          detail: tomlOutcome.detail,
+        });
+        result.valid = result.checks.every((c) => c.passed);
+        if (!result.valid && result.reasonCode === 'SUCCESS') {
+          result.reasonCode = 'FAILED';
+        }
+      }
+    }
 
     // Issue #536 — extra trustlines from assets_json gate the ready output.
     // runAccountChecks only validates the single primary asset_code/asset_issuer

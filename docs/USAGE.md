@@ -3384,6 +3384,127 @@ jobs:
       fail_on_missing: true
 ```
 
+### Reusable workflow inputs matrix (Issue #713)
+
+Every `workflow_call` input that `.github/workflows/trustbridge-reusable.yml` accepts is listed below, with the `action.yml` key it is forwarded to and its default. Defaults are copied from the workflow YAML. Where the workflow's default differs from the action's own default, the action default is shown in the notes. Inputs that are not listed here are **not** forwarded; see [Inputs the reusable workflow does not forward](#inputs-the-reusable-workflow-does-not-forward).
+
+#### Target account and comment target
+
+| Reusable input | Type | Default | Forwarded to `action.yml` | Required? | Notes |
+|---|---|---|---|---|---|
+| `stellar_address_input` | string | `""` | `stellar_address_input` | Optional | G-address to validate. Leave empty only if the caller resolves the address another way; an empty value fails validation. |
+| `issue_number` | string | `""` | `issue_number` | **Required for comment posting** outside `issues` / `pull_request` events | Pass `${{ github.event.pull_request.number \|\| github.event.issue.number }}`. Without it, `workflow_dispatch` / `merge_group` callers have no comment target. |
+
+#### Asset and reserve policy
+
+| Reusable input | Type | Default | Forwarded to `action.yml` | Required? | Notes |
+|---|---|---|---|---|---|
+| `asset_code` | string | `"USDC"` | `asset_code` | Optional | Trustline asset code. |
+| `asset_issuer` | string | `"GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"` | `asset_issuer` | Optional | Mainnet USDC issuer by default. Change it together with `horizon_url` when targeting testnet. |
+| `min_xlm_reserve` | string | `"1.5"` | `min_xlm_reserve` | Optional | Floor over the protocol minimum reserve. Strings only (`"2.5"`), because `workflow_call` has no decimal type. |
+| `clawback_strict_mode` | boolean | `false` | `clawback_strict_mode` | Optional | `true` fails the check when the trustline has clawback enabled (`reason_code: CLAWBACK_BLOCKED`). |
+
+#### Network
+
+| Reusable input | Type | Default | Forwarded to `action.yml` | Required? | Notes |
+|---|---|---|---|---|---|
+| `horizon_url` | string | `"https://horizon.stellar.org"` | `horizon_url` | Optional (set it for testnet) | Must be a public HTTPS host; private/loopback/metadata hosts are rejected (see [INPUT_VALIDATION.md](INPUT_VALIDATION.md)). |
+
+#### Gate and comment behaviour
+
+| Reusable input | Type | Default | Forwarded to `action.yml` | Required? | Notes |
+|---|---|---|---|---|---|
+| `fail_on_missing` | boolean | `true` | `fail_on_missing` | Optional | Keep `true` when the job is a required status check. |
+| `posting_mode` | string | `""` | `posting_mode` | Optional | `post`, `dry-run` or `off`. Empty defers to `comment_mode`. **Set `post` to actually comment.** |
+| `comment_mode` | string | `"dry-run"` | `comment_mode` | Optional | Legacy posting switch, only honoured when `posting_mode` is empty. Note that the reusable default is `dry-run`, whereas the action default is `sticky` / post. |
+
+#### Values the workflow sets for you
+
+| `action.yml` key | Value | Notes |
+|---|---|---|
+| `github_token` | `${{ github.token }}` | Required by the action; supplied automatically. No PAT or secret input is needed. |
+
+| Job permission | Why |
+|---|---|
+| `issues: write` | Post / update the sticky comment. |
+| `contents: read` | Read `.trustbridge.yml`. |
+| `pull-requests: read` | Resolve PR context. |
+
+**Outputs:** `ready` and `reason_code` (from the action step), available to the caller as `needs.<job>.outputs.ready` / `needs.<job>.outputs.reason_code`.
+
+#### Secrets and fork pull requests
+
+- The reusable workflow declares **no `secrets:`**. `secrets: inherit` is harmless and keeps the call forward-compatible, but nothing has to be configured.
+- The token is the **caller's** `GITHUB_TOKEN`, so the caller's `permissions:` block must grant at least `issues: write` (and `pull-requests: read`). A caller with `permissions: {}` or `contents: read` only makes comment posting fail with 403.
+- **Fork pull requests:** GitHub gives `pull_request` runs from forks a read-only `GITHUB_TOKEN` and no repository secrets, whatever the caller requests. On those runs, use `posting_mode: dry-run` (outputs and the required status still work), or post the comment from a separate `workflow_run` job. Do not switch to `pull_request_target` just to get a write token without reading [GHES_COMPATIBILITY.md](GHES_COMPATIBILITY.md) and the fork-safety notes in the README.
+- **GHES:** the `uses: …/trustbridge-reusable.yml@v1` reference must resolve on your GHES instance (mirror the repository or sync it with GitHub Connect). See [GHES_COMPATIBILITY.md](GHES_COMPATIBILITY.md).
+
+#### Org-wide caller with every input set explicitly
+
+```yaml
+name: TrustBridge wallet gate
+
+on:
+  issues:
+    types: [assigned]
+  pull_request:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  verify-wallet:
+    uses: Stellar-TrustBridge/trustbridge-action/.github/workflows/trustbridge-reusable.yml@v1
+    secrets: inherit
+    with:
+      # Target account and comment target
+      stellar_address_input: ${{ vars.CONTRIBUTOR_ADDRESS }}
+      issue_number: ${{ github.event.pull_request.number || github.event.issue.number }}
+      # Asset and reserve policy
+      asset_code: USDC
+      asset_issuer: GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN
+      min_xlm_reserve: "2"
+      clawback_strict_mode: true
+      # Network
+      horizon_url: https://horizon.stellar.org
+      # Gate and comment behaviour
+      fail_on_missing: true
+      posting_mode: ${{ github.event.pull_request.head.repo.fork && 'dry-run' || 'post' }}
+      comment_mode: sticky
+
+  payout:
+    needs: verify-wallet
+    if: needs.verify-wallet.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "reason=${{ needs.verify-wallet.outputs.reason_code }}"
+```
+
+#### Overlap with the `trustbridge-label-gate` composite
+
+[`trustbridge-label-gate`](../.github/actions/trustbridge-label-gate/action.yml) (see [Label gate pattern](#label-gate-pattern) and [LABEL_GATE_DESIGN.md](LABEL_GATE_DESIGN.md)) forwards a larger subset of `action.yml`. Inputs shared by both use the same names and defaults, so a caller can switch between them without renaming:
+
+| Input | Reusable workflow | Label-gate composite |
+|---|---|---|
+| `stellar_address_input` | ✅ `""` | ✅ `''` |
+| `horizon_url` | ✅ | ✅ |
+| `asset_code` | ✅ | ✅ |
+| `asset_issuer` | ✅ | ✅ |
+| `min_xlm_reserve` | ✅ `"1.5"` | ✅ `'1.5'` |
+| `fail_on_missing` | ✅ `true` | ✅ `'true'` |
+| `clawback_strict_mode` | ✅ `false` | ✅ `'false'` |
+| `github_token` | set to `github.token` | **required** input |
+| `posting_mode` / `comment_mode` / `issue_number` | ✅ | — (uses `sticky_comment`) |
+| `gate_labels`, `post_skip_comment`, `assignee_address_map`, fallback / cache / freshness inputs | — | ✅ |
+
+Use the label-gate composite when you need label gating, `assignee_address_map`, or Horizon fallback / cache tuning. Use the reusable workflow when you want a single, centrally pinned required status check.
+
+#### Inputs the reusable workflow does not forward
+
+Retry caps (`retry_max_delay_ms`, `retry_max_total_wait_ms`), `stellar_toml_*`, `home_domain_*`, `assets_json`, `horizon_url_fallback` and the other `action.yml` inputs keep their action defaults when called through the reusable workflow. If you need them, call the action directly, use the label-gate composite, or set them in `.trustbridge.yml` / [organization-wide policy defaults](#organization-wide-policy-defaults). Renaming any reusable input requires updating this table and `__tests__/reusable-workflows.test.ts` together.
+
 ### Configuring as a Required Status Check
 
 1. In your GitHub repository, navigate to **Settings** → **Branches** (or **Rules** → **Rulesets**).
@@ -3395,7 +3516,7 @@ jobs:
 
 ### Security and Best Practices
 
-- **Minimal Permissions:** The reusable workflow requests only `contents: read`, `issues: write`, `pull-requests: read`, and `id-token: write`.
+- **Minimal Permissions:** The reusable workflow job requests only `contents: read`, `issues: write`, and `pull-requests: read`.
 - **Pinned Version:** Always pin the reusable workflow to a major version tag (e.g. `@v1`) or a specific commit SHA.
 - **Pass-through Secrets:** Using `secrets: inherit` automatically forwards `GITHUB_TOKEN` to post/update sticky issue comments without hardcoding personal access tokens.
 - **Explicit comment target:** Pass `issue_number` from the caller workflow when the reusable workflow needs to comment on an issue or PR. This keeps TrustBridge away from untrusted body text and makes the target deterministic for `workflow_call` consumers.

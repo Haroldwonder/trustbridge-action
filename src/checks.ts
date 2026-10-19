@@ -74,7 +74,16 @@ export interface CheckConfig {
   /** Optional minimum balance for the configured asset (Issue #112). */
   minAssetBalance?: string | number;
   horizonUrl?: string;
+  /**
+   * `stellar_toml_fetch_enabled`: fetch https://{home_domain}/.well-known/stellar.toml
+   * through the SSRF gate after the on-chain home_domain check. The on-chain
+   * check runs regardless of this flag.
+   */
   stellarTomlFetchEnabled?: boolean;
+  /** `stellar_toml_cache_ttl_ms`: TTL for cached stellar.toml bodies. */
+  stellarTomlCacheTtlMs?: number;
+  /** `stellar_toml_hash_pin`: `algorithm:hex` pin for the stellar.toml body. */
+  stellarTomlHashPin?: string;
   /** How to treat a trustline that exists but is not yet authorized by the issuer. Default: "warn". */
   unauthorizedTrustlinePolicy?: UnauthorizedTrustlinePolicy;
   /** When true, a clawback-enabled trustline fails the check instead of only warning. Default: false. */
@@ -1088,11 +1097,10 @@ export function runAccountChecks(
     homeDomainCheck?.blocksValid === true;
 
   const buildResult = (): ValidationResult => {
-    if (
-      config.homeDomainCheckEnabled &&
-      homeDomainCheck &&
-      !config.stellarTomlFetchEnabled
-    ) {
+    // The on-chain home_domain check always runs when enabled; the optional
+    // stellar.toml fetch (stellar_toml_fetch_enabled) is layered on top by
+    // the caller and never replaces it (Issue #709).
+    if (config.homeDomainCheckEnabled && homeDomainCheck) {
       globalMetrics.incrementCounter(`home_domain_${homeDomainCheck.outcome}`);
       globalMetrics.recordMetric("home_domain_check", 1, "count", {
         outcome: homeDomainCheck.outcome,
