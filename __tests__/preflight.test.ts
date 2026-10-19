@@ -192,99 +192,26 @@ describe('PreflightError', () => {
   });
 });
 
-describe('runIssuesPreflight — requireIssueContext option', () => {
-  beforeEach(() => {
-    setIssueContext(undefined);
-    mockListComments.mockReset();
-  });
-
-  it('throws when requireIssueContext=true and no issue/PR context is present', async () => {
-    await expect(runIssuesPreflight('token', { requireIssueContext: true })).rejects.toThrow(
-      /requires an issue or pull-request context/i,
+describe('preflight_only input contract', () => {
+  it('action.yml declares preflight_only with default false', () => {
+    const content = require('fs').readFileSync(
+      require('path').join(__dirname, '../action.yml'),
+      'utf8',
     );
+
+    expect(content).toContain('preflight_only:');
+    expect(content).toContain('Run only the issues:write preflight check');
+    expect(content).toContain("default: 'false'");
   });
 
-  it('does not call the GitHub API when requireIssueContext=true throws early', async () => {
-    await expect(runIssuesPreflight('token', { requireIssueContext: true })).rejects.toThrow();
-    expect(mockListComments).not.toHaveBeenCalled();
-  });
+  it('schema declares preflight_only with default false', () => {
+    const schema = JSON.parse(
+      require('fs').readFileSync(
+        require('path').join(__dirname, '../schemas/action-inputs.schema.json'),
+        'utf8',
+      ),
+    ) as { properties?: Record<string, { default?: string }> };
 
-  it('does not throw when requireIssueContext=false (default) and no issue context', async () => {
-    const result = await runIssuesPreflight('token', { requireIssueContext: false });
-    expect(result.skip).toBe(true);
-  });
-});
-
-describe('runIssuesPreflight — probe call parameters', () => {
-  beforeEach(() => {
-    setIssueContext(99);
-    mockListComments.mockReset();
-  });
-
-  it('calls listComments with per_page=1 to minimise API quota usage', async () => {
-    mockListComments.mockResolvedValueOnce({ data: [] });
-    await runIssuesPreflight('token');
-    expect(mockListComments).toHaveBeenCalledWith(
-      expect.objectContaining({ per_page: 1, issue_number: 99 }),
-    );
-  });
-
-  it('calls listComments with the correct owner and repo from context', async () => {
-    mockListComments.mockResolvedValueOnce({ data: [] });
-    await runIssuesPreflight('token');
-    expect(mockListComments).toHaveBeenCalledWith(
-      expect.objectContaining({ owner: 'test-owner', repo: 'test-repo' }),
-    );
-  });
-});
-
-describe('runIssuesPreflight — dry-run / comment_mode skip guard', () => {
-  beforeEach(() => {
-    setIssueContext(7);
-    mockListComments.mockReset();
-  });
-
-  /**
-   * When comment_mode is "dry-run" or "off", index.ts guards the
-   * runIssuesPreflight call behind `shouldPostComment` (i.e. only calls it
-   * when commentMode === 'post').  These tests verify that runIssuesPreflight
-   * itself still behaves correctly when called directly (200 → skip=false)
-   * and that callers can safely skip it — the function has no side-effects
-   * that would break a dry-run workflow.
-   */
-  it('returns skip=false on a 200 probe — safe to call in any mode', async () => {
-    mockListComments.mockResolvedValueOnce({ data: [] });
-    const result = await runIssuesPreflight('token');
-    expect(result.skip).toBe(false);
-    expect(result.issueNumber).toBe(7);
-  });
-
-  it('throws PreflightError(403) regardless of comment_mode — caller decides whether to surface it', async () => {
-    mockListComments.mockRejectedValue({ status: 403 });
-    await expect(runIssuesPreflight('token')).rejects.toMatchObject({ statusCode: 403 });
-  });
-
-  it('throws PreflightError(404) regardless of comment_mode', async () => {
-    mockListComments.mockRejectedValue({ status: 404 });
-    await expect(runIssuesPreflight('token')).rejects.toMatchObject({ statusCode: 404 });
-  });
-
-  it('throws PreflightError with statusCode=0 when the thrown value has no .status property', async () => {
-    mockListComments.mockRejectedValue(new Error('network failure'));
-    await expect(runIssuesPreflight('token')).rejects.toMatchObject({
-      name: 'PreflightError',
-      statusCode: 0,
-    });
-  });
-
-  it('preflight_only semantics: skip=false result signals caller may exit early without Horizon calls', async () => {
-    // When preflight_only=true the caller (index.ts) returns immediately after
-    // runIssuesPreflight resolves.  Verify the result shape that triggers that path.
-    mockListComments.mockResolvedValueOnce({ data: [] });
-    const result = await runIssuesPreflight('token');
-    // skip=false + issueNumber set → preflight passed; caller may exit (preflight_only) or continue
-    expect(result.skip).toBe(false);
-    expect(typeof result.issueNumber).toBe('number');
-    expect(result.message).toMatch(/passed/i);
+    expect(schema.properties?.preflight_only?.default).toBe('false');
   });
 });

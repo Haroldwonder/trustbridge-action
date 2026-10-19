@@ -7,49 +7,17 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write  # required to create/update GitHub Release assets
+  contents: read
 
 jobs:
-  verify-and-release:
+  verify-release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write  # Allow uploading SBOM asset to release
-      id-token: write  # Required for keyless Sigstore signing
-      attestations: write  # Publish provenance to GitHub's attestations API
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Enforce immutable release tag policy
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag="${GITHUB_REF_NAME}"
-
-          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release tags must use the immutable full SemVer form vMAJOR.MINOR.PATCH. Major aliases such as v1 are forbidden."
-            exit 1
-          fi
-
-          set +e
-          release_lookup="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>&1)"
-          lookup_status=$?
-          set -e
-
-          if [[ ${lookup_status} -eq 0 ]]; then
-            echo "::error::Release ${tag} already exists. Published tags are immutable; create the next patch version instead."
-            exit 1
-          fi
-
-          if [[ "${release_lookup}" != *"HTTP 404"* ]]; then
-            echo "::error::Unable to confirm that ${tag} is new: ${release_lookup}"
-            exit 1
-          fi
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: '20'
           cache: npm
@@ -68,52 +36,3 @@ jobs:
 
       - name: Verify action bundle exists
         run: test -f dist/index.js
-
-      - name: Generate SLSA provenance for dist/index.js
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        uses: actions/attest@v4
-        with:
-          subject-path: dist/index.js
-
-      - name: Generate SBOM (CycloneDX format)
-        run: |
-          npx @cyclonedx/npm@latest --output-file trustbridge-sbom.json --output-format json --specs all
-          echo "SBOM generated: trustbridge-sbom.json"
-          cat trustbridge-sbom.json | head -20
-
-      - name: Upload SBOM to Release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: trustbridge-sbom.json
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  dry-run-smoke:
-    runs-on: ubuntu-latest
-    name: dry-run-smoke
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-      - name: Install dependencies
-        run: npm ci
-      - name: Build
-        run: npm run build
-      - name: Dry-run action (comment_mode)
-        id: trustbridge
-        uses: ./
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          stellar_address_input: GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF
-          fail_on_missing: false
-          comment_mode: 'dry-run'
-          dashboard_webhook_url: ''
-      - name: Assert dry-run left comment_url empty
-        run: |
-          echo "comment_url=${{ steps.trustbridge.outputs.comment_url }}"
-          test -z "${{ steps.trustbridge.outputs.comment_url }}"

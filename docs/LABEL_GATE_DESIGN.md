@@ -63,7 +63,22 @@ Define a composite action at `.github/actions/trustbridge-label-gate/action.yml`
 3. **Outputs**:
    - `gate_skipped`: `'true'` if the gate was skipped, `'false'` otherwise.
    - `gate_label_found`: Name of the first gate label that was found (or empty if gate was skipped).
-   - All TrustBridge action outputs (forwarded only when gate is open).
+   - All TrustBridge action outputs (forwarded only when gate is open):
+     - `account_funded` / `check_account_funded` — whether the account exists on the Stellar network.
+     - `trustline_exists` / `check_trustline` — whether the configured asset trustline exists.
+     - `xlm_balance` — native XLM balance string from Horizon.
+     - `check_xlm_reserve` — `true` if XLM balance meets `min_xlm_reserve`.
+     - `asset_balance` — configured asset (e.g. USDC) balance or `0` / `unknown`.
+     - `asset_balance_met` — `true` when `min_asset_balance` is unset or the balance meets the floor.
+     - `comment_url` — URL of the created or updated issue comment.
+     - `ready` — `true` when all validation checks passed.
+
+   When the gate is **skipped** all TrustBridge pass-through outputs are empty
+   strings. Always check `gate_skipped` before branching on them:
+
+   ```yaml
+   if: steps.gate.outputs.gate_skipped != 'true' && steps.gate.outputs.account_funded == 'true'
+   ```
 
 ---
 
@@ -242,6 +257,55 @@ jobs:
 
 ---
 
+## Concurrency for Rapid Label Changes
+
+Use a concurrency group keyed by repository and issue number so events for the
+same issue do not run TrustBridge at the same time. This is especially useful
+when `labeled` and `unlabeled` events arrive close together: overlapping runs
+can race while updating the sticky comment or changing wallet-related labels.
+
+For an issue-only workflow, add this at the workflow level:
+
+```yaml
+concurrency:
+  group: trustbridge-label-gate-${{ github.repository }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+```
+
+Workflow-level concurrency serializes all jobs in this workflow for that
+issue. If only one job performs TrustBridge or other issue mutations, job-level
+concurrency can be used instead. Include a workflow-specific prefix in the
+group so another workflow does not unintentionally share the same group.
+
+For workflows that also support `workflow_dispatch`, avoid putting runs with
+no issue number into one shared group. Use a workflow-dispatch issue-number
+input when supplied, and otherwise give the manual run its own group:
+
+```yaml
+concurrency:
+  group: trustbridge-label-gate-${{ github.repository }}-${{ github.event.issue.number || inputs.issue_number || github.run_id }}
+  cancel-in-progress: false
+```
+
+`cancel-in-progress: false` is the safer default for sticky comments and label
+mutations: let the active run finish, then allow the newest pending run for
+that issue to proceed. GitHub retains at most one pending run per concurrency
+group, so a burst of label changes can replace an older pending run rather
+than processing every intermediate event. This is generally appropriate when
+the desired result is the latest gate outcome, not an audit of every toggle.
+
+Setting `cancel-in-progress: true` favors responsiveness by cancelling the
+active run as soon as a newer run for that issue starts. Use it only when
+stopping an in-flight validation is acceptable. Cancellation can interrupt
+comment or label updates, leaving a previous result visible until a later run
+completes; it is not a rollback mechanism.
+
+Concurrency serializes runs, but it does not refresh their event payloads. The
+composite currently evaluates `github.event.issue.labels`, which is the label
+snapshot attached to each event. If correctness must reflect the issue's
+current labels at execution time, fetch the issue's labels from the GitHub API
+inside the workflow immediately before evaluating the gate.
+
 ## Edge Cases & Error Handling
 
 ### Case 1: No Label Permission (403)
@@ -377,7 +441,7 @@ Programs should define their own labels and document them in their contributing 
 
 ### Testing approach
 
-- Use dry-run workflows (`.github/workflows/dry-run.yml`) to test label gate logic locally.
+- Use `posting_mode: dry-run` in a local workflow to exercise label gate logic without posting comments.
 - Mock issue labels in test workflow inputs.
 - Verify outputs are correctly forwarded or set to sentinel values.
 

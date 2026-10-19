@@ -61,9 +61,36 @@ export function parseHorizonBalance(balance: string): number {
 
 This is safe for the XLM reserve comparison because the values involved
 (typically 1–20 XLM) are far below the 53-bit safe-integer boundary
-(~9 × 10^15). For large credit-asset amounts the action only tests for the
-**presence** of a trustline (binary yes/no) — it never does arithmetic on
-credit-asset balances — so `parseHorizonBalance` is not called on those values.
+(~9 × 10^15). Credit-asset balances can be much larger, so the
+`min_asset_balance` comparison does **not** use `parseHorizonBalance`; it
+compares integer stroops instead (see below).
+
+---
+
+## `min_asset_balance` comparison (stroop precision)
+
+Credit-asset balances can reach 922,337,203,685.4775807 units, where a
+JavaScript `number` can no longer tell two amounts one stroop apart. The
+`min_asset_balance` check therefore compares **`BigInt` stroops**, never
+floats:
+
+1. The Horizon balance string is converted with `toStroops(balance)`
+   (`src/checks.ts`). Horizon always returns 7 decimals, so this is exact.
+2. `min_asset_balance` is converted with `toStroops(value, 'ceil')`. Digits
+   beyond the 7th decimal round **up** to the next stroop — a balance, being
+   whole stroops, meets `1.00000001` exactly when it meets `1.0000001`.
+3. The check passes when `balance >= threshold` (`buildAssetBalanceRequirement`).
+   A balance equal to the threshold passes; one stroop below fails.
+4. The reported deficit is `threshold − balance` formatted from stroops with
+   `formatStroops`, e.g. `0.0000001`.
+
+| `min_asset_balance` | Balance | Result |
+|---------------------|---------|--------|
+| `100` | `100.0000000` | pass |
+| `100` | `99.9999999` | fail, deficit `0.0000001` |
+| `100` | `100.0000001` | pass |
+| `1.00000001` | `1.0000000` | fail |
+| `1.00000001` | `1.0000001` | pass |
 
 ---
 
@@ -222,7 +249,7 @@ This split is covered by snapshot tests (`__tests__/comment.test.ts`) and output
 ## Cross-references
 
 - `src/horizon.ts` — `parseHorizonBalance`, `getNativeBalance`, `HorizonBalance` types
-- `src/checks.ts` — `parseMinXlmReserve`, `buildReserveRequirement`, `formatXlmDeficit`
+- `src/checks.ts` — `parseMinXlmReserve`, `buildReserveRequirement`, `formatXlmDeficit`, `toStroops`, `formatStroops`, `buildAssetBalanceRequirement`
 - [USAGE.md — Outputs in downstream jobs](USAGE.md#outputs-in-downstream-jobs)
 - [ERROR_HANDLING.md — Validation failures (200 OK)](ERROR_HANDLING.md#validation-failures-200-ok)
 - [Stellar documentation — Lumens](https://developers.stellar.org/docs/learn/fundamentals/lumens)

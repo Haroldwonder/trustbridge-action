@@ -12,6 +12,7 @@
 
 import { ValidationResult, CheckResultItem } from './checks';
 import { CheckPlugin, CheckPluginContext, PluginRegistry, defaultRegistry } from './plugin';
+import { escapeMarkdownInline } from './markdown';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -67,11 +68,14 @@ export function runPlugins(
   });
 
   // Build the checks array from plugin results.
-  const checks: CheckResultItem[] = pluginOutputs.map(({ plugin, result }) => ({
-    passed: result.passed,
-    label: plugin.label,
-    detail: result.detail,
-  }));
+  const checks: CheckResultItem[] = pluginOutputs.map(({ plugin, result }) => {
+    const isCore = plugin.id.startsWith('trustbridge/');
+    return {
+      passed: result.passed,
+      label: isCore ? plugin.label : escapeMarkdownInline(plugin.label),
+      detail: isCore ? result.detail : escapeMarkdownInline(result.detail),
+    };
+  });
 
   const valid = checks.every((c) => c.passed);
 
@@ -88,7 +92,10 @@ export function runPlugins(
   // Collect remediation strings from failed plugins.
   const remediationParts = pluginOutputs
     .filter(({ result }) => !result.passed && result.remediation)
-    .map(({ result }) => result.remediation as string);
+    .map(({ plugin, result }) => {
+      const isCore = plugin.id.startsWith('trustbridge/');
+      return isCore ? result.remediation as string : escapeMarkdownInline(result.remediation as string);
+    });
 
   const remediation = remediationParts.length > 0 ? remediationParts.join('\n\n') : undefined;
 

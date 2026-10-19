@@ -209,7 +209,42 @@ An input or output **must** remain in the warn state for **at least one full maj
 
 | Input / Output | Deprecated in | Replacement | Planned removal |
 |----------------|--------------|-------------|-----------------|
-| _(none yet)_ | — | — | — |
+| `skip_if_maintainer` | v1.x (Issue #448) | `skip_for_maintainers` | v2.0.0 |
+
+### `skip_if_maintainer` → `skip_for_maintainers` (Issue #448)
+
+`skip_if_maintainer` was introduced alongside `skip_for_maintainers` as a
+naming variant. Two names for one behaviour invited a precedence question that
+was never documented, and the original `a || b` read was misleading: because
+`action.yml` gives `skip_for_maintainers` a `false` default, the truthy string
+`"false"` short-circuited the fallback and the alias was effectively
+unreachable.
+
+**Resolved precedence** (canonical always wins):
+
+1. `skip_for_maintainers` set to an explicit boolean → that value is used. The
+   alias is ignored, even if it says the opposite.
+2. Otherwise `skip_if_maintainer` set to an explicit boolean → that value is
+   used, plus a deprecation warning.
+3. Neither set → `false`.
+
+Conflicting values resolve in favour of the canonical input and emit an
+explicit warning; no value is silently chosen.
+
+**Risk of the deprecated alias.** The alias enables exactly the same opt-out as
+the canonical input, so it carries the identical security consideration:
+enabling either on contributor-facing workflows lets a maintainer actor bypass
+validation. The alias is deprecated for clarity and future removal, **not**
+because it is less safe. Migration is behaviour-preserving and needs no
+security review.
+
+| Change | Classification |
+| --- | --- |
+| `skip_if_maintainer` marked deprecated in `action.yml` + docs | Non-breaking (MINOR) |
+| Runtime deprecation warning when the alias is used | Non-breaking (MINOR) |
+| Runtime conflict warning when both inputs disagree | Non-breaking (MINOR) |
+| Documented canonical-wins precedence | Non-breaking (MINOR) — restores the alias to its documented contract |
+| Removal of `skip_if_maintainer` in v2 | **Breaking (MAJOR)** — covered by the warn → remove lifecycle above |
 
 ---
 
@@ -227,7 +262,115 @@ Initial public release. No breaking changes from a prior major.
 
 ### v1 → v2 (placeholder)
 
-> _Not yet released. This section will be populated when the first breaking change is introduced._
+> _These breaking changes will take effect in the upcoming v2 release._
+- **Removed Export**: Removed deprecated `TROUBLESHOOTING_FAQ_BASE` from `src/markdown.ts`. Use `DEFAULT_FAQ_BASE_URL` from `src/links.ts` directly.
+
+---
+
+## Cache backend fallback behavior (Issue #462)
+
+When a `selectedBackend` value is provided to `SimpleCache` that is not one of the supported values (`"memory"`, `"github-actions"`), the cache **silently falls back to in-memory mode** and emits a `core.warning`. This is a non-breaking, non-fatal behavior: workflows continue to execute correctly using the in-memory cache.
+
+### Supported named backends
+
+| Value | Behavior |
+|-------|----------|
+| `"memory"` (default) | In-process heap cache only; no persistence across steps, jobs, or runs |
+| `"github-actions"` | Backed by `GitHubActionsCacheBackend`; equivalent to `useActionsCacheBackend: true` |
+
+Any other value is **unsupported**. A `core.warning` is emitted immediately with:
+- The unsupported value that was requested.
+- The list of supported values.
+- A message that in-memory fallback is active.
+
+This warning is visible in the GitHub Actions log without requiring `debug_mode: true`.
+
+### Change classification
+
+Adding this warning is a **non-breaking change** (new warning, same runtime behavior). No workflow file update is required. If you intentionally pass an unsupported `selectedBackend` value via a programmatic `SimpleCache` constructor (e.g. in a plugin), update it to one of the supported values to suppress the warning.
+
+---
+
+The signed webhook payload emitted by `src/webhook.ts` is a **public API surface** — dashboard receivers and downstream automation switch on its field names and types. Renames and removals are breaking changes even when the action's workflow-level inputs/outputs are otherwise untouched.
+
+### v1 schema is frozen
+
+The fields listed in `schemas/webhook-payload.schema.json` under `schema_version: "1"` are **immutable**:
+
+| Field | Frozen since | Notes |
+|-------|-------------|-------|
+| `schema_version` | v1 | Always the string `"1"` for v1 payloads |
+| `event` | v1 | Always `"validation_complete"` |
+| `timestamp` | v1 | ISO-8601 UTC string |
+| `repository` | v1 | `"owner/repo"` format |
+| `issue_number` | v1 | Integer ≥ 1 or `null` |
+| `stellar_address` | v1 | Redacted first-4…last-4 |
+| `result.valid` | v1 | Boolean |
+| `result.account_funded` | v1 | Boolean |
+| `result.trustline_exists` | v1 | Boolean |
+| `result.xlm_balance` | v1 | 7-decimal string |
+| `result.checks[].label` | v1 | String |
+| `result.checks[].passed` | v1 | Boolean |
+
+**No field in this table may be renamed, removed, or have its type changed in any v1.x release.**
+
+### What is allowed in v1.x (additive changes)
+
+- Adding new **optional** top-level fields to the payload (e.g. `run_id`, `reason_code`).
+- Adding new items to `result.checks[]` — the array length is not contractually fixed.
+- Adding new **optional** fields to each `result.checks[]` item.
+- Adding new allowed values to `schema_version` (handled by upgrading to a new schema version alongside the old).
+
+Dashboard receivers MUST tolerate unknown fields gracefully (do not use `additionalProperties: false` validation on the receiver side against the v1 schema — use it only as a minimum-field check).
+
+### What requires a MAJOR version bump (v2+)
+
+| Change | Reason |
+|--------|--------|
+| Removing any field from the frozen list above | Breaks receivers that read it |
+| Renaming any field (e.g. `result.valid` → `result.is_valid`) | Breaks receivers |
+| Changing `result.valid` from boolean to string | Type mismatch breaks typed receivers |
+| Changing `stellar_address` format (e.g. full address instead of redacted) | PII leak + format change |
+| Changing the HMAC header name from `X-TrustBridge-Signature` | Breaks receiver signature verification |
+| Changing the HMAC algorithm from SHA-256 | Breaks receiver verification |
+
+When introducing a breaking payload change, increment `schema_version` in the payload **and** publish the new JSON Schema as `schemas/webhook-payload-v2.schema.json`. Run both schemas simultaneously for a deprecation window before removing v1 support.
+
+### Header versioning
+
+The HTTP header `X-TrustBridge-Schema-Version: 1` is sent with every webhook delivery alongside `X-TrustBridge-Signature`. Dashboard receivers can use this header for version routing without parsing the body first:
+
+```
+POST /webhook HTTP/1.1
+Content-Type: application/json
+X-TrustBridge-Signature: sha256=<hex>
+X-TrustBridge-Schema-Version: 1
+User-Agent: trustbridge-action/1
+```
+
+### Checklist for maintainers touching webhook.ts
+
+- [ ] Is the change additive only? If yes — no schema version bump needed.
+- [ ] Does the change rename or remove a frozen field? If yes — this is a MAJOR bump.
+- [ ] Is a new optional field added? Update `schemas/webhook-payload.schema.json` (mark as not-required).
+- [ ] Run `npm test -- --testPathPattern 'webhook'` — the contract tests must pass.
+- [ ] If introducing a new `schema_version`, add a new frozen-fields table above and update `buildWebhookPayload` to emit the new version for new consumers while keeping backward compatibility.
+
+---
+
+## Action Inputs: `posting_mode` vs `comment_mode` (Issue #418)
+
+### Summary of Change
+In previous versions, `comment_mode` had conflicting declarations across action specifications:
+1. Controlling GitHub comment posting behavior (`post`, `dry-run`, `off`).
+2. Controlling comment threading strategy (`sticky`, `new`, `reply`).
+
+### Resolution & Inputs
+- **`posting_mode`**: Dedicated input for comment posting policy. Allowed values: `'post'` (default), `'dry-run'`, `'off'`.
+- **`comment_mode`**: Dedicated input for comment threading strategy. Allowed values: `'sticky'` (default), `'new'`, `'reply'`.
+
+### Backward Compatibility
+To avoid breaking existing workflows that configured `comment_mode: dry-run` or `comment_mode: off`, `src/index.ts` automatically falls back to using `comment_mode` as `posting_mode` when `posting_mode` is omitted and `comment_mode` is set to `post`, `dry-run`, or `off`.
 
 ---
 

@@ -1,5 +1,5 @@
 {
-  "id": "health-check",
+  "id": "b6d6f9b2-4f9d-4d70-ae4d-9cbf00fbb509",
   "name": "GET / — Horizon root health probe",
   "request": {
     "method": "GET",

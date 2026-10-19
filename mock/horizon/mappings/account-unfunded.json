@@ -1,5 +1,5 @@
 {
-  "id": "unfunded-account",
+  "id": "b6d6f9b2-4f9d-4d70-ae4d-9cbf00fbb508",
   "name": "GET /accounts/{address} — unfunded account (404)",
   "request": {
     "method": "GET",

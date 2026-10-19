@@ -1,5 +1,5 @@
 {
-  "id": "rate-limited",
+  "id": "b6d6f9b2-4f9d-4d70-ae4d-9cbf00fbb510",
   "name": "GET /accounts/{address} — rate limited (429) with Retry-After header",
   "request": {
     "method": "GET",

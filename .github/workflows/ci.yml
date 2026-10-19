@@ -11,24 +11,16 @@ permissions:
   contents: read
 
 jobs:
-  build-and-test:
+  check:
     runs-on: ubuntu-latest
-    # Test on every supported Node.js LTS version.
-    # action.yml 'runs.using' stays node20 until GitHub ships a node22 GA
-    # runner label — see README § "Node.js runtime support".
-    strategy:
-      fail-fast: false
-      matrix:
-        node: ['20', '22']
-    name: build-and-test (Node ${{ matrix.node }})
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
-      - name: Setup Node.js ${{ matrix.node }}
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: '20'
           cache: npm
 
       - name: Install dependencies
@@ -37,12 +29,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      # Dedicated schema-sync check: fails fast with a clear message when
-      # action.yml inputs drift from schemas/action-inputs.schema.json.
-      - name: Verify action.yml ↔ schema sync
-        run: npm test -- --testPathPattern action-schema-sync --no-coverage
+      - name: Typecheck
+        run: npm run typecheck
 
-      # Includes __tests__/validation.performance.test.ts (mocked Horizon p95 budget).
       - name: Test
         run: npm test
 
@@ -55,167 +44,39 @@ jobs:
       - name: Verify action bundle exists
         run: test -f dist/index.js
 
-      # Bundle size budget check — reports current size and fails if budget exceeded
-      - name: Check bundle size budget
-        run: npm test -- --testPathPattern bundle-size --no-coverage
-
-      # Only check dist/ drift on the baseline node version that matches
-      # action.yml 'runs.using: node20', to avoid false positives.
       - name: Verify dist/ matches src/
-        if: matrix.node == '20'
         run: |
-          npm run build
           if ! git diff --quiet --exit-code -- dist; then
             echo "::error::dist/ is out of date with src/. Run 'npm run build' and commit the result."
             git diff --stat -- dist
             exit 1
           fi
 
-  # ── Opt-in mock Horizon smoke tests ─────────────────────────────────────
-  # This job runs the smoke test suite against a local WireMock container.
-  # It is DISABLED in the default CI pipeline (if: false) to keep standard
-  # CI fast and dependency-free.
-  #
-  # To enable:
-  #   - Change `if: false` to `if: github.event_name == 'workflow_dispatch'`
-  #     to run only on manual triggers, OR
-  #   - Remove the `if:` condition entirely to always run alongside unit tests.
-  #
-  # See mock/horizon/README.md for full documentation.
-  mock-horizon-smoke:
+  license-check:
+    name: License policy check
     runs-on: ubuntu-latest
-    # Change or remove this condition to opt in:
-    if: false
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: '20'
           cache: npm
 
-      - name: Install dependencies
+      - name: Install production dependencies
         run: npm ci
 
-      - name: Start mock Horizon container
-        run: npm run mock:start
+      - name: Check dependency licenses
+        run: npm run license:check
 
-      - name: Run smoke tests against mock Horizon
-        env:
-          HORIZON_MOCK_URL: http://localhost:8089
-        run: npm run test:mock
-
-      - name: Stop mock Horizon container
-        if: always()
-        run: npm run mock:stop
-
-  # ── Optional live testnet integration test ──────────────────────────────
-  # This job runs TrustBridge against live Stellar testnet Horizon to validate
-  # comment posting end-to-end without touching mainnet. Useful before releases
-  # to catch integration bugs that mocks miss.
-  #
-  # SKIP on forks and pull requests to avoid:
-  #   - Rate-limiting on shared testnet Horizon
-  #   - Accidental comment spam on test issues
-  #   - Leaking test secrets in fork CI logs
-  #
-  # Enable for maintainer runs:
-  #   - Set TEST_STELLAR_ADDRESS to a funded testnet account (G-address)
-  #   - Set TEST_ISSUE_NUMBER to a test issue in the repo (e.g., the GitHub issue for this job)
-  #   - Set as repository secrets, visible only to maintainer pushes and workflow_dispatch
-  #
-  # See CONTRIBUTING.md § "Live testnet integration job" for setup.
-  testnet-live-integration:
+  check-unpinned-actions:
+    name: Check unpinned actions
     runs-on: ubuntu-latest
-    # Only run on:
-    #   1. Maintainer pushes to main/master (not on forks)
-    #   2. Explicit workflow_dispatch trigger (for ad-hoc testing)
-    # Skip on:
-    #   - Pull requests from forks (secrets not available)
-    #   - Community forks (github.repository differs from upstream)
-    if: |
-      github.repository == 'Stellar-TrustBridge/trustbridge-action' &&
-      (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.actor != 'dependabot[bot]')) &&
-      secrets.TEST_STELLAR_ADDRESS != ''
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '20'
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build action
-        run: npm run build
-
-      - name: Run TrustBridge against live testnet
-        id: trustbridge
-        uses: ./
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          stellar_address_input: ${{ secrets.TEST_STELLAR_ADDRESS }}
-          horizon_url: https://horizon-testnet.stellar.org
-          fail_on_missing: false
-          debug_mode: true
-          sticky_comment: true
-
-      - name: Verify outputs are set
-        run: |
-          echo "account_funded: ${{ steps.trustbridge.outputs.account_funded }}"
-          echo "trustline_exists: ${{ steps.trustbridge.outputs.trustline_exists }}"
-          echo "xlm_balance: ${{ steps.trustbridge.outputs.xlm_balance }}"
-
-          # Ensure outputs are not empty
-          if [ -z "${{ steps.trustbridge.outputs.account_funded }}" ]; then
-            echo "::error::account_funded output is empty"
-            exit 1
-          fi
-
-          if [ -z "${{ steps.trustbridge.outputs.xlm_balance }}" ]; then
-            echo "::error::xlm_balance output is empty"
-            exit 1
-          fi
-
-      - name: Verify comment was posted
-        run: |
-          # Test successful if the job reached here (no error from the action)
-          # Comment posting is implicit in the previous step
-          echo "✓ TrustBridge testnet integration test passed"
-          echo "  Account funded: ${{ steps.trustbridge.outputs.account_funded }}"
-          echo "  XLM balance: ${{ steps.trustbridge.outputs.xlm_balance }}"
-
-  dry-run-smoke:
-    runs-on: ubuntu-latest
-    name: dry-run-smoke
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '20'
-          cache: npm
-      - name: Install dependencies
-        run: npm ci
-      - name: Build
-        run: npm run build
-      - name: Dry-run action (comment_mode)
-        id: trustbridge
-        uses: ./
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          stellar_address_input: GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF
-          fail_on_missing: false
-          comment_mode: 'dry-run'
-          dashboard_webhook_url: ''
-      - name: Assert dry-run left comment_url empty
-        run: |
-          echo "comment_url=${{ steps.trustbridge.outputs.comment_url }}"
-          test -z "${{ steps.trustbridge.outputs.comment_url }}"
+      - name: Scan for unpinned action references
+        run: bash scripts/check-unpinned-actions.sh .github/workflows

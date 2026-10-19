@@ -19,12 +19,160 @@ export interface ActionTimings {
   total_ms?: number;
 }
 
+export interface AssetTrustlineStatus {
+  assetCode: string;
+  assetIssuer: string;
+  trustlineExists: boolean;
+  balance: string;
+}
+
 export interface ActionOutputExtras {
   horizonUrl?: string;
   assetCode?: string;
   assetIssuer?: string;
+  assetsTrustlineStatus?: AssetTrustlineStatus[];
   timings?: ActionTimings;
   validatedAt?: string;
+  assigneeLogin?: string;
+  stellarAddress?: string;
+  /**
+   * #319 — Conflict report to embed in outputs. When present,
+   * `conflict_report` and `has_conflicts` outputs are set accordingly.
+   */
+  conflictReport?: ConflictReport | null;
+  /** #459 — Friendbot outputs */
+  friendbotCalled?: boolean;
+  friendbotSuccess?: boolean;
+  friendbotTransactionHash?: string;
+  /**
+   * #550 — GitHub Check Run outputs. When `use_check_runs` is enabled,
+   * index.ts passes the created run's id and conclusion here so
+   * `setValidationOutputs` stays the single publisher of every action.yml
+   * output. Absent values publish as empty strings, matching the
+   * "empty otherwise" contract documented in action.yml.
+   */
+  checkRunId?: string;
+  checkRunConclusion?: string;
+}
+
+// ---------------------------------------------------------------------------
+// #319 — Merge-resolution conflict report
+// ---------------------------------------------------------------------------
+
+/**
+ * A single source that provided a value for a given field.
+ */
+export interface ConflictSource {
+  /** Symbolic source name: 'workflow_input' | 'assignee_map' | 'contract' | 'config_file'. */
+  source: string;
+  /** The raw value provided by this source (redacted if privacyMode). */
+  value: string;
+}
+
+/**
+ * A detected conflict — two or more sources disagree on the same field.
+ */
+export interface ConflictEntry {
+  /** The field that has conflicting values (e.g. 'stellar_address', 'asset_issuer'). */
+  field: string;
+  /** The value that was ultimately used (winning source according to precedence). */
+  resolvedValue: string;
+  /** All sources that provided a value, including the winner. */
+  sources: ConflictSource[];
+}
+
+/**
+ * Complete conflict report for a single run.
+ */
+export interface ConflictReport {
+  /** True when at least one conflict was found. */
+  hasConflicts: boolean;
+  /** List of individual field conflicts. Empty when `hasConflicts` is false. */
+  conflicts: ConflictEntry[];
+  /** ISO-8601 timestamp. */
+  generatedAt: string;
+}
+
+/**
+ * Build a `ConflictReport` from a map of field → sources.
+ * A conflict exists when a field has values from ≥ 2 sources that disagree.
+ *
+ * @param fieldSources  Map from field name to an array of `ConflictSource` items.
+ * @param privacyMode   When true, address values are masked to first4…last4.
+ * @param now           ISO-8601 timestamp override for testing.
+ */
+export function buildConflictReport(
+  fieldSources: Record<string, ConflictSource[]>,
+  options: { privacyMode?: boolean; now?: string } = {},
+): ConflictReport {
+  const privacyMode = Boolean(options.privacyMode);
+  const generatedAt = options.now ?? new Date().toISOString();
+  const conflicts: ConflictEntry[] = [];
+
+  for (const [field, sources] of Object.entries(fieldSources)) {
+    if (!sources || sources.length < 2) continue;
+
+    // Mask values if privacy mode — redact G/C addresses to first4…last4.
+    const maskedSources: ConflictSource[] = sources.map((s) => ({
+      source: s.source,
+      value: privacyMode ? maskConflictValue(s.value) : s.value,
+    }));
+
+    const uniqueValues = new Set(maskedSources.map((s) => s.value));
+    if (uniqueValues.size <= 1) continue; // All sources agree — no conflict.
+
+    // The first source in the array is the winner (caller must supply in
+    // precedence order: workflow_input > assignee_map > contract > config_file).
+    const resolvedValue = maskedSources[0]!.value;
+    conflicts.push({ field, resolvedValue, sources: maskedSources });
+  }
+
+  return {
+    hasConflicts: conflicts.length > 0,
+    conflicts,
+    generatedAt,
+  };
+}
+
+/**
+ * Mask a value for privacy mode.
+ * Redacts G/C Stellar addresses to first4…last4; leaves other values intact.
+ */
+function maskConflictValue(value: string): string {
+  return value.replace(/\b([GC][A-Z2-7]{55})\b/g, (addr) => {
+    return `${addr.slice(0, 4)}…${addr.slice(-4)}`;
+  });
+}
+
+/**
+ * Format a `ConflictReport` as a Markdown section for embedding in an issue
+ * comment.
+ *
+ * Returns an empty string when there are no conflicts so callers can
+ * unconditionally append the result.
+ */
+export function formatConflictReportMarkdown(report: ConflictReport | null | undefined): string {
+  if (!report || !report.hasConflicts) return '';
+
+  const lines: string[] = [
+    '### ⚠️ Input source conflicts detected',
+    '',
+    '> Two or more sources provided different values for the same input field.',
+    '> The value with the highest precedence (`workflow_input` > `assignee_map` > `contract` > `config_file`) was used.',
+    '',
+    '| Field | Resolved value | Sources |',
+    '| --- | --- | --- |',
+  ];
+
+  for (const conflict of report.conflicts) {
+    const sourceSummary = conflict.sources
+      .map((s) => `\`${s.source}\`: \`${s.value}\``)
+      .join(', ');
+    lines.push(`| \`${conflict.field}\` | \`${conflict.resolvedValue}\` | ${sourceSummary} |`);
+  }
+
+  lines.push('');
+  return lines.join('\n');
 }
 
 export interface ActionOutputs {
@@ -58,6 +206,48 @@ export interface ActionOutputs {
   timing_total_ms: string;
   num_sponsoring: string;
   num_sponsored: string;
+  /**
+   * #319 — Merge-resolution conflict report.
+   * JSON string listing sources that disagree on the Stellar address or
+   * validation inputs (e.g. workflow input vs assignee-map vs contract).
+   * Empty string (`""`) when there are no conflicts.
+   */
+  conflict_report: string;
+  /**
+   * #319 — True when at least one source conflict was detected this run.
+   * Allows downstream steps to gate on `steps.trustbridge.outputs.has_conflicts == 'true'`.
+   */
+  has_conflicts: string;
+  network_passphrase_mismatch: string;
+  expected_network_passphrase: string;
+  actual_network_passphrase: string;
+  assignee_results_json: string;
+  matrix_ready_map: string;
+  /**
+   * GitHub Checks API integration (Wave #26 / Issue #421). ID of the created
+   * Check Run when `use_check_runs` is true, empty otherwise.
+   */
+  check_run_id: string;
+  /** Conclusion of the created Check Run (success/failure), empty when skipped. */
+  check_run_conclusion: string;
+  // #459 Friendbot outputs
+  friendbot_called: string;
+  friendbot_success: string;
+  friendbot_transaction_hash: string;
+  assets_trustline_status: string;
+  trustlines_summary: string;
+  /**
+   * Batch-mode outputs (Issue #670).
+   *
+   * Published on the batch code path in index.ts, which returns before
+   * `setValidationOutputs` runs. Single-address runs publish empty strings here
+   * so the action.yml output contract stays total: every declared output has a
+   * value in every mode, and a consumer never has to distinguish "unset" from
+   * "empty string".
+   */
+  batch_summary_json: string;
+  batch_passed_count: string;
+  batch_failed_count: string;
 }
 
 export function toActionOutputs(
@@ -69,6 +259,42 @@ export function toActionOutputs(
   const timings = extras.timings ?? {};
   const validatedAt = extras.validatedAt ?? new Date().toISOString();
   const { markdown: badgeMarkdown, url: badgeUrl } = generateBadgeSnippets(result);
+  
+  const mismatch = result.networkPassphraseMismatch;
+  
+  // Matrix-friendly outputs (Issue #3)
+  const assigneeResultsJson = extras.assigneeLogin && extras.stellarAddress
+    ? JSON.stringify({
+        [extras.assigneeLogin]: {
+          ready: result.valid,
+          stellar_address: extras.stellarAddress,
+          xlm_balance: result.xlmBalance,
+          account_funded: result.accountFunded,
+          trustline_exists: result.trustlineExists,
+          reason_code: result.reasonCode ?? (result.valid ? 'SUCCESS' : 'FAILED'),
+          validated_at: validatedAt,
+        },
+      })
+    : '{}';
+
+  const matrixReadyMap = extras.assigneeLogin
+    ? JSON.stringify({
+        [extras.assigneeLogin]: result.valid,
+      })
+    : '{}';
+
+  const assetsTrustlineStatus = (extras.assetsTrustlineStatus ?? []).map(
+    (status) => ({
+      asset_code: status.assetCode,
+      asset_issuer: status.assetIssuer,
+      trustline_exists: status.trustlineExists,
+      balance: status.balance,
+    }),
+  );
+  const presentTrustlines = assetsTrustlineStatus.filter(
+    (status) => status.trustline_exists,
+  ).length;
+  
   return {
     trustline_exists: String(result.trustlineExists),
     xlm_balance: result.xlmBalance,
@@ -107,6 +333,30 @@ export function toActionOutputs(
     timing_total_ms: String(timings.total_ms ?? 0),
     num_sponsoring: String(result.sponsorshipInfo?.numSponsoring ?? 0),
     num_sponsored: String(result.sponsorshipInfo?.numSponsored ?? 0),
+    // #319 — conflict report
+    conflict_report: extras.conflictReport
+      ? JSON.stringify(extras.conflictReport)
+      : '',
+    has_conflicts: String(extras.conflictReport?.hasConflicts ?? false),
+    network_passphrase_mismatch: String(Boolean(mismatch)),
+    expected_network_passphrase: mismatch?.expectedPassphrase ?? '',
+    actual_network_passphrase: mismatch?.actualPassphrase ?? '',
+    assignee_results_json: assigneeResultsJson,
+    matrix_ready_map: matrixReadyMap,
+    // #550 — Check Run outputs published through the single output publisher.
+    // Empty strings when no Check Run was created, per the action.yml contract.
+    check_run_id: extras.checkRunId ?? '',
+    check_run_conclusion: extras.checkRunConclusion ?? '',
+    friendbot_called: String(Boolean(extras.friendbotCalled)),
+    friendbot_success: String(Boolean(extras.friendbotSuccess)),
+    friendbot_transaction_hash: extras.friendbotTransactionHash ?? '',
+    assets_trustline_status: JSON.stringify(assetsTrustlineStatus),
+    trustlines_summary: `${presentTrustlines} of ${assetsTrustlineStatus.length} additional trustlines present`,
+    // Batch-mode outputs. Empty in single-address mode; index.ts overwrites
+    // these on the batch path before returning. (Issue #670)
+    batch_summary_json: '',
+    batch_passed_count: '',
+    batch_failed_count: '',
   };
 }
 
@@ -162,4 +412,105 @@ export function writeValidationJson(options: WriteValidationJsonOptions): Valida
 
   fs.writeFileSync(absolutePath, JSON.stringify(payload, null, 2), 'utf8');
   return payload;
+}
+
+// ---------------------------------------------------------------------------
+// Matrix-friendly output helpers (Issue #3)
+// ---------------------------------------------------------------------------
+
+export interface AssigneeResult {
+  ready: boolean;
+  stellar_address: string;
+  xlm_balance: string;
+  account_funded: boolean;
+  trustline_exists: boolean;
+  reason_code: string;
+  validated_at: string;
+}
+
+export type AssigneeResultsMap = Record<string, AssigneeResult>;
+export type MatrixReadyMap = Record<string, boolean>;
+
+/**
+ * Build matrix-friendly JSON outputs from multiple validation results.
+ * This enables GitHub matrix workflows to access per-assignee results via
+ * `fromJSON(steps.trustbridge.outputs.matrix_ready_map)`.
+ *
+ * Example usage in a matrix workflow:
+ * ```yaml
+ * strategy:
+ *   matrix:
+ *     assignee: [alice, bob, charlie]
+ * steps:
+ *   - id: check
+ *     run: |
+ *       READY=$(echo '${{ steps.trustbridge.outputs.matrix_ready_map }}' | jq -r '.["${{ matrix.assignee }}"]')
+ *       echo "ready=$READY" >> $GITHUB_OUTPUT
+ * ```
+ *
+ * @param results Array of validation results with assignee metadata
+ * @returns JSON string maps for assignee_results_json and matrix_ready_map
+ */
+export function buildMatrixOutputs(
+  results: Array<{
+    assigneeLogin: string;
+    stellarAddress: string;
+    validationResult: ValidationResult;
+    validatedAt?: string;
+  }>,
+): { assigneeResultsJson: string; matrixReadyMap: string } {
+  const assigneeResults: AssigneeResultsMap = {};
+  const readyMap: MatrixReadyMap = {};
+
+  for (const { assigneeLogin, stellarAddress, validationResult, validatedAt } of results) {
+    const validated = validatedAt ?? new Date().toISOString();
+    
+    assigneeResults[assigneeLogin] = {
+      ready: validationResult.valid,
+      stellar_address: stellarAddress,
+      xlm_balance: validationResult.xlmBalance,
+      account_funded: validationResult.accountFunded,
+      trustline_exists: validationResult.trustlineExists,
+      reason_code: validationResult.reasonCode ?? (validationResult.valid ? 'SUCCESS' : 'FAILED'),
+      validated_at: validated,
+    };
+
+    readyMap[assigneeLogin] = validationResult.valid;
+  }
+
+  return {
+    assigneeResultsJson: JSON.stringify(assigneeResults),
+    matrixReadyMap: JSON.stringify(readyMap),
+  };
+}
+
+/**
+ * Sanitize a GitHub username for use as a matrix dimension or output key.
+ * Replaces characters that could cause issues in GitHub Actions expressions
+ * with safe alternatives.
+ *
+ * Rules:
+ * - Hyphens and underscores preserved
+ * - Other special characters replaced with underscore
+ * - Leading digits prefixed with underscore
+ * - Empty string becomes "unknown"
+ *
+ * @param username GitHub username (e.g., from assignee.login)
+ * @returns Sanitized key safe for GitHub Actions output names
+ */
+export function sanitizeUsernameForMatrix(username: string): string {
+  if (!username || username.trim().length === 0) {
+    return 'unknown';
+  }
+
+  let sanitized = username
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, '_');
+
+  // Prefix with underscore if starts with digit
+  if (/^\d/.test(sanitized)) {
+    sanitized = '_' + sanitized;
+  }
+
+  return sanitized || 'unknown';
 }

@@ -10,6 +10,7 @@ import {
   COMMENT_SIZE_LIMIT_BYTES,
   COMMENT_TRUNCATION_NOTICE_BYTES,
   findStickyComment,
+  findFirstTrustBridgeComment,
   formatCommentBody,
   isTrustBridgeComment,
   postIssueComment,
@@ -377,6 +378,66 @@ describe('formatCommentBody', () => {
     });
     expect(body).toContain('`0.0000000 USDC`');
   });
+
+  describe('per-asset trustline table from assets_json (Issue #552)', () => {
+    const usdcIssuer = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
+    const eurcIssuer = 'GCQT3YKVGZBWV2VE3TTV6LSUYOUJxLNJILDKEH2Y7RK3QUIYFJWKKRR2';
+
+    it('renders a per-asset table when config.assets is provided', () => {
+      const body = formatCommentBody(validationResult, {
+        ...baseConfig,
+        horizonUrl: 'https://horizon.stellar.org',
+        assets: [
+          { assetCode: 'EURC', assetIssuer: eurcIssuer, trustlineExists: true, balance: '12.5000000' },
+          { assetCode: 'FOO', assetIssuer: usdcIssuer, trustlineExists: false, balance: '0' },
+        ],
+      });
+
+      expect(body).toContain('### Asset trustlines');
+      expect(body).toContain('| Asset | Trustline | Balance | Issuer |');
+      expect(body).toContain('| EURC | ✅ exists | `12.5000000` |');
+      expect(body).toContain('| FOO | ❌ missing | `0` — no trustline |');
+      // Issuer is shortened but recognisable.
+      expect(body).toContain(`${eurcIssuer.slice(0, 4)}…${eurcIssuer.slice(-4)}`);
+    });
+
+    it('omits the section when no assets are configured (single-asset runs unchanged)', () => {
+      const body = formatCommentBody(validationResult, {
+        ...baseConfig,
+        horizonUrl: 'https://horizon.stellar.org',
+      });
+
+      expect(body).not.toContain('### Asset trustlines');
+      // Golden-path content is untouched.
+      expect(body).toContain('### Balances');
+    });
+
+    it('escapes markdown-sensitive asset codes (injection guard)', () => {
+      const body = formatCommentBody(validationResult, {
+        ...baseConfig,
+        horizonUrl: 'https://horizon.stellar.org',
+        assets: [
+          { assetCode: 'A_B[C](D)', assetIssuer: usdcIssuer, trustlineExists: true, balance: '1.0000000' },
+        ],
+      });
+
+      // The raw code must not appear unescaped anywhere in the body.
+      const esc = String.fromCharCode(92);
+      expect(body).toContain(`A${esc}_B${esc}[C${esc}]${esc}(D${esc})`);
+    });
+
+    it('renders unknown balance as informational placeholder', () => {
+      const body = formatCommentBody(validationResult, {
+        ...baseConfig,
+        horizonUrl: 'https://horizon.stellar.org',
+        assets: [
+          { assetCode: 'EURC', assetIssuer: eurcIssuer, trustlineExists: true, balance: 'unknown' },
+        ],
+      });
+
+      expect(body).toContain('| EURC | ✅ exists | _unknown_ |');
+    });
+  });
 });
 
 function makeOctokit(overrides: Record<string, jest.Mock> = {}) {
@@ -399,20 +460,29 @@ function makeOctokit(overrides: Record<string, jest.Mock> = {}) {
 }
 
 
-describe('findStickyComment', () => {
-  function issueGraphqlResponse(
-    nodes: Array<{ id: string; databaseId: number; body: string }>,
-    pageInfo: { hasNextPage: boolean; endCursor: string | null },
-  ) {
-    return {
-      repository: {
-        issue: {
-          comments: { nodes, pageInfo },
-        },
+/**
+ * Shape a GraphQL issue-comments response. Hoisted to module scope so both
+ * the `findStickyComment` and `findFirstTrustBridgeComment` suites can use
+ * it (previously defined inside one describe block but used by both, which
+ * broke compilation of this suite).
+ */
+function issueGraphqlResponse(
+  nodes: Array<{ id: string; databaseId: number; body: string }>,
+  pageInfo: { hasNextPage: boolean; endCursor: string | null } = {
+    hasNextPage: false,
+    endCursor: null,
+  },
+) {
+  return {
+    repository: {
+      issue: {
+        comments: { nodes, pageInfo },
       },
-    };
-  }
+    },
+  };
+}
 
+describe('findStickyComment', () => {
   it('returns the databaseId of the comment containing the marker via GraphQL pagination across multiple pages', async () => {
     const octokit = makeOctokit();
     octokit.graphql
@@ -516,9 +586,67 @@ describe('findStickyComment', () => {
   });
 });
 
+describe('findFirstTrustBridgeComment (Issue #419)', () => {
+  it('finds the first matching comment via GraphQL when multiple comments exist', async () => {
+    const octokit = makeOctokit();
+    octokit.graphql.mockResolvedValue(
+      issueGraphqlResponse([
+        { id: 'IC_1', databaseId: 101, body: 'unrelated comment' },
+        { id: 'IC_2', databaseId: 102, body: `${STICKY_COMMENT_MARKER}\nfirst TrustBridge result` },
+        { id: 'IC_3', databaseId: 103, body: `${STICKY_COMMENT_MARKER}\nsecond TrustBridge result` },
+      ]),
+    );
+
+    const id = await findFirstTrustBridgeComment(
+      octokit as unknown as Parameters<typeof findFirstTrustBridgeComment>[0],
+      'owner',
+      'repo',
+      42,
+    );
+
+    expect(id).toBe(102);
+  });
+
+  it('falls back to REST pagination if GraphQL fails and finds the first match', async () => {
+    const octokit = makeOctokit();
+    octokit.graphql.mockRejectedValue(new Error('GraphQL API unavailable'));
+    octokit.paginate.mockResolvedValue([
+      { id: 1, body: 'unrelated comment' },
+      { id: 2, body: `${STICKY_COMMENT_MARKER}\nfirst match` },
+      { id: 3, body: `${STICKY_COMMENT_MARKER}\nsecond match` },
+    ]);
+
+    const id = await findFirstTrustBridgeComment(
+      octokit as unknown as Parameters<typeof findFirstTrustBridgeComment>[0],
+      'owner',
+      'repo',
+      42,
+    );
+
+    expect(id).toBe(2);
+  });
+
+  it('returns undefined when no comment has the marker', async () => {
+    const octokit = makeOctokit();
+    octokit.graphql.mockResolvedValue(
+      issueGraphqlResponse([{ id: 'IC_1', databaseId: 101, body: 'unrelated comment' }]),
+    );
+
+    const id = await findFirstTrustBridgeComment(
+      octokit as unknown as Parameters<typeof findFirstTrustBridgeComment>[0],
+      'owner',
+      'repo',
+      42,
+    );
+
+    expect(id).toBeUndefined();
+  });
+});
+
 describe('postIssueComment', () => {
   const mockedGithub = github as unknown as {
     context: {
+      eventName: string;
       payload: { issue?: { number: number } };
       repo: { owner: string; repo: string };
       apiUrl: string;
@@ -527,6 +655,7 @@ describe('postIssueComment', () => {
   };
 
   beforeEach(() => {
+    mockedGithub.context.eventName = 'issues';
     mockedGithub.context.payload = { issue: { number: 7 } };
     mockedGithub.context.apiUrl = 'https://api.github.com';
   });
@@ -556,6 +685,7 @@ describe('postIssueComment', () => {
     expect(octokit.rest.issues.createComment).toHaveBeenCalledWith(
       expect.objectContaining({ issue_number: 7, body: 'new body' }),
     );
+    expect(octokit.graphql).not.toHaveBeenCalled();
     expect(octokit.rest.issues.updateComment).not.toHaveBeenCalled();
     expect(mockedGithub.getOctokit).toHaveBeenCalledWith('token', {
       baseUrl: 'https://api.github.com',
@@ -608,6 +738,102 @@ describe('postIssueComment', () => {
     expect(url).toBe('https://github.com/o/r/issues/7#issuecomment-3');
     expect(octokit.rest.issues.createComment).toHaveBeenCalled();
     expect(octokit.rest.issues.updateComment).not.toHaveBeenCalled();
+  });
+
+  it('posts a threaded reply referencing the first TrustBridge comment when commentMode is reply', async () => {
+    const octokit = makeOctokit();
+    // Simulate first TrustBridge comment at id 42, later comment at id 99
+    octokit.paginate.mockResolvedValue([
+      { id: 42, body: `${STICKY_COMMENT_MARKER}\nfirst comment` },
+      { id: 99, body: `${STICKY_COMMENT_MARKER}\nsecond comment` },
+    ]);
+    octokit.rest.issues.createComment.mockResolvedValue({
+      data: { html_url: 'https://github.com/o/r/issues/7#issuecomment-100' },
+    });
+    mockedGithub.getOctokit.mockReturnValue(octokit);
+
+    const url = await postIssueComment('token', 'reply check result', {
+      commentMode: 'reply',
+    });
+
+    expect(url).toBe('https://github.com/o/r/issues/7#issuecomment-100');
+    expect(octokit.rest.issues.createComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issue_number: 7,
+        body: expect.stringContaining('> _Reply to [TrustBridge check #42](https://github.com/test-owner/test-repo/issues/7#issuecomment-42)_'),
+      }),
+    );
+    expect(octokit.rest.issues.updateComment).not.toHaveBeenCalled();
+  });
+
+  it('falls back to creating a normal top-level comment when commentMode is reply and no prior comment exists', async () => {
+    const octokit = makeOctokit();
+    octokit.paginate.mockResolvedValue([]);
+    octokit.rest.issues.createComment.mockResolvedValue({
+      data: { html_url: 'https://github.com/o/r/issues/7#issuecomment-1' },
+    });
+    mockedGithub.getOctokit.mockReturnValue(octokit);
+
+    const url = await postIssueComment('token', 'first check result', {
+      commentMode: 'reply',
+    });
+
+    expect(url).toBe('https://github.com/o/r/issues/7#issuecomment-1');
+    expect(octokit.rest.issues.createComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issue_number: 7,
+        body: 'first check result',
+      }),
+    );
+    expect(octokit.rest.issues.updateComment).not.toHaveBeenCalled();
+  });
+
+  it('creates a fresh top-level comment without reply header when commentMode is new', async () => {
+    const octokit = makeOctokit();
+    octokit.paginate.mockResolvedValue([
+      { id: 42, body: `${STICKY_COMMENT_MARKER}\nfirst comment` },
+    ]);
+    octokit.rest.issues.createComment.mockResolvedValue({
+      data: { html_url: 'https://github.com/o/r/issues/7#issuecomment-2' },
+    });
+    mockedGithub.getOctokit.mockReturnValue(octokit);
+
+    const url = await postIssueComment('token', 'new mode body', {
+      commentMode: 'new',
+    });
+
+    expect(url).toBe('https://github.com/o/r/issues/7#issuecomment-2');
+    expect(octokit.rest.issues.createComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issue_number: 7,
+        body: 'new mode body',
+      }),
+    );
+    expect(octokit.rest.issues.updateComment).not.toHaveBeenCalled();
+  });
+
+  it('updates existing comment in place when commentMode is sticky', async () => {
+    const octokit = makeOctokit();
+    octokit.paginate.mockResolvedValue([
+      { id: 88, body: `${STICKY_COMMENT_MARKER}\nsticky body` },
+    ]);
+    octokit.rest.issues.updateComment.mockResolvedValue({
+      data: { html_url: 'https://github.com/o/r/issues/7#issuecomment-88' },
+    });
+    mockedGithub.getOctokit.mockReturnValue(octokit);
+
+    const url = await postIssueComment('token', 'updated sticky body', {
+      commentMode: 'sticky',
+    });
+
+    expect(url).toBe('https://github.com/o/r/issues/7#issuecomment-88');
+    expect(octokit.rest.issues.updateComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        comment_id: 88,
+        body: 'updated sticky body',
+      }),
+    );
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled();
   });
 
   it('suppresses comment update when maintainer added :zzz: reaction within snooze window', async () => {
@@ -793,6 +1019,7 @@ describe('findStickyDiscussionComment', () => {
 describe('postDiscussionComment', () => {
   const mockedGithub = github as unknown as {
     context: {
+      eventName: string;
       payload: { discussion?: { node_id?: string }; issue?: { number: number } };
       repo: { owner: string; repo: string };
       apiUrl: string;
@@ -803,6 +1030,7 @@ describe('postDiscussionComment', () => {
   const DISCUSSION_NODE_ID = 'DIC_kwDOABCD';
 
   beforeEach(() => {
+    mockedGithub.context.eventName = 'discussion';
     mockedGithub.context.payload = { discussion: { node_id: DISCUSSION_NODE_ID } };
     mockedGithub.context.apiUrl = 'https://api.github.com';
   });
@@ -862,7 +1090,7 @@ describe('postDiscussionComment', () => {
       });
     mockedGithub.getOctokit.mockReturnValue(octokit);
 
-    const url = await postDiscussionComment('token', 'updated body', { sticky: true });
+    const url = await postDiscussionComment('token', 'updated body', { commentMode: 'sticky' });
 
     expect(url).toBe('https://github.com/o/r/discussions/12#discussioncomment-99');
     expect(octokit.graphql).toHaveBeenCalledTimes(2);
@@ -1015,6 +1243,42 @@ describe('buildTruncatedCommentBody', () => {
     const truncated = buildTruncatedCommentBody(exactBody, reportPath);
     expect(Buffer.byteLength(truncated, 'utf8')).toBeLessThanOrEqual(COMMENT_SIZE_LIMIT_BYTES);
   });
+
+  // ── GHES fixture: smaller comment cap ──────────────────────────────────
+  describe('GHES-like smaller comment cap', () => {
+    const GHES_SMALL_LIMIT = 32000;
+
+    it('truncates to a smaller GHES-style limit when sizeLimit is provided', () => {
+      const body = 'x'.repeat(GHES_SMALL_LIMIT + 5000);
+      const truncated = buildTruncatedCommentBody(body, reportPath, GHES_SMALL_LIMIT);
+      expect(Buffer.byteLength(truncated, 'utf8')).toBeLessThanOrEqual(GHES_SMALL_LIMIT);
+    });
+
+    it('includes the truncation notice even with a smaller limit', () => {
+      const body = 'A'.repeat(GHES_SMALL_LIMIT + 1000);
+      const truncated = buildTruncatedCommentBody(body, reportPath, GHES_SMALL_LIMIT);
+      expect(truncated).toContain('⚠️ Report truncated');
+      expect(truncated).toContain(reportPath);
+    });
+
+    it('preserves the sticky marker footer with a smaller limit', () => {
+      const body = 'B'.repeat(GHES_SMALL_LIMIT + 500);
+      const truncated = buildTruncatedCommentBody(body, reportPath, GHES_SMALL_LIMIT);
+      expect(truncated).toContain('trustbridge-action');
+    });
+
+    it('cuts on a line boundary with a smaller limit', () => {
+      const line = 'line content here\n';
+      const repeated = line.repeat(Math.ceil((GHES_SMALL_LIMIT + 3000) / line.length));
+      const truncated = buildTruncatedCommentBody(repeated, reportPath, GHES_SMALL_LIMIT);
+      const noticeSeparator = '---\n> **⚠️ Report truncated**';
+      const cutIndex = truncated.indexOf(noticeSeparator);
+      if (cutIndex > 0) {
+        const before = truncated.slice(0, cutIndex);
+        expect(before.endsWith('\n') || before.endsWith('\n\n')).toBe(true);
+      }
+    });
+  });
 });
 
 describe('writeFullReport', () => {
@@ -1071,5 +1335,477 @@ describe('writeFullReport', () => {
 
     const written = fs.readFileSync(outputPath, 'utf8');
     expect(written).toBe(body);
+  });
+});
+
+// ── Custom comment template integration tests (#312) ─────────────────────────
+
+describe('formatCommentBody with custom_comment_template_path', () => {
+  let tmpDir: string;
+  let savedWorkspace: string | undefined;
+
+  beforeAll(() => {
+    jest.spyOn(Date, 'now').mockReturnValue(1000000000000);
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tb-comment-template-'));
+    // Set GITHUB_WORKSPACE so loadCommentTemplate treats tmpDir as workspace root
+    savedWorkspace = process.env['GITHUB_WORKSPACE'];
+    process.env['GITHUB_WORKSPACE'] = tmpDir;
+  });
+
+  afterAll(() => {
+    jest.restoreAllMocks();
+    // Restore GITHUB_WORKSPACE
+    if (savedWorkspace === undefined) {
+      delete process.env['GITHUB_WORKSPACE'];
+    } else {
+      process.env['GITHUB_WORKSPACE'] = savedWorkspace;
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const makeResult = (valid: boolean) => ({
+    ...validationResult,
+    valid,
+    accountFunded: valid,
+    trustlineExists: valid,
+    xlmReserveMet: valid,
+    xlmBalance: valid ? '10.0000000' : '0',
+  });
+
+  it('injects template partial before the footer when path is valid', () => {
+    const templateFile = path.join(tmpDir, 'custom.md');
+    fs.writeFileSync(templateFile, '### Custom Wave Help\n\nContact: wave@example.com');
+
+    const body = formatCommentBody(makeResult(false), {
+      ...baseConfig,
+      horizonUrl: 'https://horizon.stellar.org',
+      customCommentTemplatePath: 'custom.md',
+    });
+
+    // Partial appears before the footer
+    const partialIdx = body.indexOf('Custom Wave Help');
+    const footerIdx = body.indexOf('_Posted by [trustbridge-action]');
+    expect(partialIdx).toBeGreaterThan(0);
+    expect(partialIdx).toBeLessThan(footerIdx);
+  });
+
+  it('interpolates {{account}} and {{status}} in partial', () => {
+    const templateFile = path.join(tmpDir, 'interp.md');
+    fs.writeFileSync(templateFile, 'For {{account}}: {{status}}');
+
+    const body = formatCommentBody(makeResult(true), {
+      ...baseConfig,
+      horizonUrl: 'https://horizon.stellar.org',
+      customCommentTemplatePath: 'interp.md',
+    });
+
+    expect(body).toContain('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF');
+    expect(body).toContain('✅ ready');
+  });
+
+  it('does not break comment when customCommentTemplatePath is undefined', () => {
+    const body = formatCommentBody(makeResult(false), {
+      ...baseConfig,
+      horizonUrl: 'https://horizon.stellar.org',
+    });
+
+    expect(body).toContain('_Posted by [trustbridge-action]');
+    expect(body).not.toContain('Custom Wave Help');
+  });
+
+  it('emits a core.warning when the template file does not exist', () => {
+    const { warning } = jest.requireMock('@actions/core') as { warning: jest.Mock };
+    warning.mockClear();
+
+    formatCommentBody(makeResult(false), {
+      ...baseConfig,
+      horizonUrl: 'https://horizon.stellar.org',
+      customCommentTemplatePath: 'does-not-exist.md',
+    });
+
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining('was not found in the workspace'),
+    );
+  });
+
+  it('emits a core.warning and omits partial when template contains <script>', () => {
+    const { warning } = jest.requireMock('@actions/core') as { warning: jest.Mock };
+    warning.mockClear();
+
+    const templateFile = path.join(tmpDir, 'evil.md');
+    fs.writeFileSync(templateFile, 'Hello <script>alert(1)</script>');
+
+    const body = formatCommentBody(makeResult(false), {
+      ...baseConfig,
+      horizonUrl: 'https://horizon.stellar.org',
+      customCommentTemplatePath: 'evil.md',
+    });
+
+    expect(body).not.toContain('<script>');
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to load custom comment template'),
+    );
+    // Footer is still present — comment is never broken by template failure
+    expect(body).toContain('_Posted by [trustbridge-action]');
+  });
+
+  it('emits a core.warning and omits partial on path traversal attempt', () => {
+    const { warning } = jest.requireMock('@actions/core') as { warning: jest.Mock };
+    warning.mockClear();
+
+    const body = formatCommentBody(makeResult(false), {
+      ...baseConfig,
+      horizonUrl: 'https://horizon.stellar.org',
+      customCommentTemplatePath: '../../../../etc/passwd',
+    });
+
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to load custom comment template'),
+    );
+    expect(body).toContain('_Posted by [trustbridge-action]');
+  });
+
+  it('omits partial and warns on {{constructor}} in template', () => {
+    const { warning } = jest.requireMock('@actions/core') as { warning: jest.Mock };
+    warning.mockClear();
+
+    const templateFile = path.join(tmpDir, 'proto.md');
+    fs.writeFileSync(templateFile, 'Oops: {{constructor}}');
+
+    const body = formatCommentBody(makeResult(false), {
+      ...baseConfig,
+      horizonUrl: 'https://horizon.stellar.org',
+      customCommentTemplatePath: 'proto.md',
+    });
+
+    expect(body).not.toContain('constructor');
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to load custom comment template'),
+    );
+  });
+
+  it('escapes Markdown injection in template variables from address', () => {
+    // Simulate a "malicious" address that contains link injection syntax.
+    // In production, addresses are validated G-addresses, but the template
+    // system must still escape whatever it receives.
+    const templateFile = path.join(tmpDir, 'injection.md');
+    fs.writeFileSync(templateFile, 'Account: {{account}}');
+
+    const body = formatCommentBody(makeResult(false), {
+      ...baseConfig,
+      stellarAddress: 'G][evil](https://steal.example)',
+      horizonUrl: 'https://horizon.stellar.org',
+      customCommentTemplatePath: 'injection.md',
+    });
+
+    // ] ( ) should be escaped in the template substitution, breaking any link
+    expect(body).toContain('\\]\\[evil\\]\\(https://steal.example\\)');
+    // Footer is still present — comment is never broken by escaped content
+    expect(body).toContain('_Posted by [trustbridge-action]');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #450 — reason_code + ready in the validation-gate section
+// ---------------------------------------------------------------------------
+
+describe('Issue #450 — validation gate exposes reason_code and ready', () => {
+  const gateConfig = {
+    ...baseConfig,
+    horizonUrl: 'https://horizon.stellar.org',
+  };
+
+  const passing: ValidationResult = {
+    valid: true,
+    accountFunded: true,
+    trustlineExists: true,
+    xlmBalance: '10.5000000',
+    xlmReserveMet: true,
+    checks: [
+      { passed: true, label: 'Account funded', detail: 'ok' },
+      { passed: true, label: 'USDC trustline', detail: 'ok' },
+    ],
+  };
+
+  const failing: ValidationResult = {
+    valid: false,
+    accountFunded: false,
+    trustlineExists: false,
+    xlmBalance: '0',
+    xlmReserveMet: false,
+    checks: [
+      { passed: false, label: 'Account funded', detail: 'unfunded' },
+      { passed: true, label: 'USDC trustline', detail: 'ok' },
+    ],
+  };
+
+  it('shows reason_code and ready on the success path', () => {
+    const body = formatCommentBody(passing, gateConfig);
+    expect(body).toContain('### Validation gate');
+    expect(body).toContain('- Ready: `true`');
+    expect(body).toContain('- Reason code: `SUCCESS`');
+  });
+
+  it('shows reason_code and ready on a failure path', () => {
+    const body = formatCommentBody(failing, gateConfig);
+    expect(body).toContain('- Ready: `false`');
+    expect(body).toContain('- Reason code: `FAILED`');
+  });
+
+  it('prefers an explicit reasonCode from the result', () => {
+    const body = formatCommentBody(
+      { ...failing, reasonCode: 'ACCOUNT_NOT_FUNDED' },
+      gateConfig,
+    );
+    expect(body).toContain('- Reason code: `ACCOUNT_NOT_FUNDED`');
+    expect(body).not.toContain('- Reason code: `FAILED`');
+  });
+
+  it('stays consistent with the reason_code action output on a known failure', () => {
+    const body = formatCommentBody(
+      { ...failing, reasonCode: 'TRUSTLINE_MISSING' },
+      gateConfig,
+    );
+    expect(body).toContain('- Reason code: `TRUSTLINE_MISSING`');
+  });
+
+  it('localizes the reason_code and ready labels', () => {
+    const body = formatCommentBody(passing, { ...gateConfig, locale: 'es' });
+    expect(body).toContain('### Puerta de validación');
+    expect(body).toContain('- Listo: `true`');
+    expect(body).toContain('- Código de razón: `SUCCESS`');
+  });
+
+  it('neutralizes a backtick inside reason_code via the code span', () => {
+    const body = formatCommentBody(
+      { ...failing, reasonCode: 'BAD`CODE' },
+      gateConfig,
+    );
+    expect(body).toContain('- Reason code: `BAD\\`CODE`');
+  });
+
+  it('keeps snake_case reason codes literal and copy-pasteable', () => {
+    const body = formatCommentBody(
+      { ...failing, reasonCode: 'ACCOUNT_NOT_FUNDED' },
+      gateConfig,
+    );
+    // Inside a code span, underscores need no escaping — a machine-readable
+    // code must be copy-pasteable straight from the comment.
+    expect(body).toContain('- Reason code: `ACCOUNT_NOT_FUNDED`');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #434 — circuit-breaker banner
+// ---------------------------------------------------------------------------
+
+describe('Issue #434 — circuit-breaker open comment section', () => {
+  const circuitConfig = {
+    ...baseConfig,
+    horizonUrl: 'https://horizon.stellar.org',
+  };
+
+  const circuitOpenResult: ValidationResult = {
+    valid: false,
+    accountFunded: false,
+    trustlineExists: false,
+    xlmBalance: 'unknown',
+    xlmReserveMet: false,
+    reasonCode: 'CIRCUIT_OPEN',
+    circuitOpen: true,
+    checks: [
+      {
+        passed: false,
+        label: 'Horizon availability',
+        detail: 'Circuit breaker is open.',
+      },
+    ],
+  };
+
+  it('renders a circuit-breaker banner when the circuit was open', () => {
+    const body = formatCommentBody(circuitOpenResult, circuitConfig);
+    expect(body).toContain('**Circuit breaker open**');
+    expect(body).toContain('was **not** checked');
+    expect(body).toContain('Reason code: `CIRCUIT_OPEN`');
+  });
+
+  it('states that the account was not checked and offers a recovery hint', () => {
+    const body = formatCommentBody(circuitOpenResult, circuitConfig);
+    expect(body).toContain('recovery window');
+    expect(body).toContain('re-run the workflow');
+  });
+
+  it('mirrors the CIRCUIT_OPEN reason code into the validation gate', () => {
+    const body = formatCommentBody(circuitOpenResult, circuitConfig);
+    expect(body).toContain('- Ready: `false`');
+    expect(body).toContain('- Reason code: `CIRCUIT_OPEN`');
+  });
+
+  it('omits the banner for a normal account failure', () => {
+    const body = formatCommentBody(
+      {
+        valid: false,
+        accountFunded: false,
+        trustlineExists: false,
+        xlmBalance: '0',
+        xlmReserveMet: false,
+        reasonCode: 'ACCOUNT_NOT_FUNDED',
+        checks: [{ passed: false, label: 'Account funded', detail: 'unfunded' }],
+      },
+      circuitConfig,
+    );
+    expect(body).not.toContain('Circuit breaker open');
+  });
+
+  it('localizes the circuit-breaker banner', () => {
+    const body = formatCommentBody(circuitOpenResult, {
+      ...circuitConfig,
+      locale: 'es',
+    });
+    expect(body).toContain('**Disyuntor abierto**');
+    expect(body).toContain('Código de razón: `CIRCUIT_OPEN`');
+  });
+
+  it('leaks no account data in the banner (PII-safe)', () => {
+    const body = formatCommentBody(circuitOpenResult, circuitConfig);
+    const bannerStart = body.indexOf('**Circuit breaker open**');
+    expect(bannerStart).toBeGreaterThan(-1);
+    const bannerBlock = body.slice(bannerStart).split('\n### ')[0] ?? '';
+    // The banner carries no address, issuer, or endpoint URL.
+    expect(bannerBlock).not.toContain(circuitConfig.stellarAddress);
+    expect(bannerBlock).not.toContain(circuitConfig.assetIssuer);
+    expect(bannerBlock).not.toContain(circuitConfig.horizonUrl);
+    // Balances stay "unknown" rather than leaking a stale figure.
+    expect(body).toContain('**Native XLM balance:** _unknown_');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #691 — Soroban C-address comment redaction parity with logs
+// ---------------------------------------------------------------------------
+
+describe('Issue #691 — privacy mode redacts C-addresses in comments', () => {
+  const gAddress = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+  const cAddress = 'CCXJ2GPAR7WR4IF7YK67VFEJEUPZJ3G7X52I4BN2PFN66Y35JSSXVP2P';
+  const issuer = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
+
+  it('does not redact addresses when privacy mode is off (default)', () => {
+    const body = formatCommentBody(validationResult, {
+      ...baseConfig,
+      horizonUrl: 'https://horizon.stellar.org',
+    });
+    expect(body).toContain(gAddress);
+    expect(body).toContain(issuer);
+  });
+
+  it('redacts G-address in comment body when privacy mode is on', () => {
+    const body = formatCommentBody(validationResult, {
+      ...baseConfig,
+      horizonUrl: 'https://horizon.stellar.org',
+      privacyMode: true,
+    });
+    // Full address must not appear
+    expect(body).not.toContain(gAddress);
+    // Redacted form appears instead
+    expect(body).toContain(`${gAddress.slice(0, 4)}...${gAddress.slice(-4)}`);
+  });
+
+  it('redacts C-address in comment body when privacy mode is on', () => {
+    const body = formatCommentBody(validationResult, {
+      ...baseConfig,
+      stellarAddress: cAddress,
+      horizonUrl: 'https://horizon.stellar.org',
+      privacyMode: true,
+    });
+    expect(body).not.toContain(cAddress);
+    expect(body).toContain(`${cAddress.slice(0, 4)}...${cAddress.slice(-4)}`);
+  });
+
+  it('redacts the asset issuer when privacy mode is on', () => {
+    const body = formatCommentBody(validationResult, {
+      ...baseConfig,
+      stellarAddress: cAddress,
+      horizonUrl: 'https://horizon.stellar.org',
+      privacyMode: true,
+    });
+    expect(body).not.toContain(issuer);
+    expect(body).toContain(`${issuer.slice(0, 4)}...${issuer.slice(-4)}`);
+  });
+
+  it('omits SEP-0007 deep links when privacy mode is on', () => {
+    const body = formatCommentBody(validationResult, {
+      ...baseConfig,
+      horizonUrl: 'https://horizon.stellar.org',
+      sep0007DeepLinks: true,
+      privacyMode: true,
+    });
+    expect(body).not.toContain('web+stellar:');
+    expect(body).not.toContain('sendXlmToActivate');
+  });
+
+  it('includes SEP-0007 deep links normally when privacy mode is off', () => {
+    const body = formatCommentBody(
+      {
+        valid: false,
+        accountFunded: false,
+        trustlineExists: false,
+        xlmBalance: '0',
+        xlmReserveMet: false,
+        checks: [{ passed: false, label: 'Account funded', detail: 'not found' }],
+      },
+      {
+        ...baseConfig,
+        horizonUrl: 'https://horizon.stellar.org',
+        sep0007DeepLinks: true,
+      },
+    );
+    expect(body).toContain('web+stellar:');
+  });
+
+  it('redacts C-address in Stellar Laboratory account viewer link', () => {
+    const body = formatCommentBody(validationResult, {
+      ...baseConfig,
+      stellarAddress: cAddress,
+      horizonUrl: 'https://horizon.stellar.org',
+      privacyMode: true,
+    });
+    // The link URL must not contain the full C-address
+    expect(body).not.toContain(`account=${cAddress}`);
+    expect(body).toContain(`account=${`${cAddress.slice(0, 4)}...${cAddress.slice(-4)}`}`);
+  });
+
+  it('redacts address in custom comment template context when privacy mode is on', () => {
+    // The template gets the address via buildTemplateContext, which should
+    // receive the redacted address when privacy mode is on.
+    // We verify that the placeholder interpolation in the comment doesn't
+    // contain the full address by checking the body.
+    const body = formatCommentBody(validationResult, {
+      ...baseConfig,
+      stellarAddress: cAddress,
+      horizonUrl: 'https://horizon.stellar.org',
+      privacyMode: true,
+    });
+    expect(body).not.toContain(cAddress);
+    expect(body).toContain(`${cAddress.slice(0, 4)}...${cAddress.slice(-4)}`);
+  });
+
+  it('uses consistent redaction format between G and C addresses', () => {
+    // Both G and C addresses should use the first-4...last-4 format
+    const gBody = formatCommentBody(validationResult, {
+      ...baseConfig,
+      horizonUrl: 'https://horizon.stellar.org',
+      privacyMode: true,
+    });
+    const cBody = formatCommentBody(validationResult, {
+      ...baseConfig,
+      stellarAddress: cAddress,
+      horizonUrl: 'https://horizon.stellar.org',
+      privacyMode: true,
+    });
+    // Both should use the same redaction pattern — first 4 + ... + last 4
+    const gRedacted = `${gAddress.slice(0, 4)}...${gAddress.slice(-4)}`;
+    const cRedacted = `${cAddress.slice(0, 4)}...${cAddress.slice(-4)}`;
+    expect(gBody).toContain(gRedacted);
+    expect(cBody).toContain(cRedacted);
   });
 });

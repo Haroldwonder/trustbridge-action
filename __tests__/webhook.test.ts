@@ -1,15 +1,34 @@
 /**
  * Tests for signed dashboard webhook support (Issue #101).
+ *
+ * Golden fixture: __tests__/fixtures/webhook-payload.json
+ * The fixture represents a canonical passing-run payload and is used to
+ * verify that buildWebhookPayload() produces a structurally identical shape,
+ * ensuring the receiver contract documented in docs/USAGE.md stays in sync
+ * with the code (Issue #326).
  */
 
+import * as path from 'path';
+import * as fs from 'fs';
+import { EventEmitter } from 'events';
+import { createServer } from 'http';
 import {
   computeWebhookSignature,
+  verifyWebhookSignature,
   buildWebhookPayload,
   deliverWebhook,
+  listenForRunnerCancellation,
   sendWebhookNotification,
   WebhookConfig,
   WebhookPayload,
 } from '../src/webhook';
+
+// ---------------------------------------------------------------------------
+// Golden fixture
+// ---------------------------------------------------------------------------
+
+const FIXTURE_PATH = path.join(__dirname, 'fixtures', 'webhook-payload.json');
+const goldenFixture: WebhookPayload = JSON.parse(fs.readFileSync(FIXTURE_PATH, 'utf8'));
 
 // Minimal ValidationResult stub
 const passedResult = {
@@ -43,6 +62,38 @@ const CONFIG: WebhookConfig = {
 };
 
 const ADDRESS = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
+
+async function startDelayedWebhookServer(): Promise<{
+  url: string;
+  requestReceived: Promise<void>;
+  close: () => Promise<void>;
+}> {
+  let resolveRequestReceived!: () => void;
+  const requestReceived = new Promise<void>((resolve) => {
+    resolveRequestReceived = resolve;
+  });
+  const server = createServer(() => resolveRequestReceived());
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('Failed to start delayed webhook test server');
+  }
+
+  return {
+    url: `http://127.0.0.1:${address.port}/webhook`,
+    requestReceived,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.closeAllConnections();
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // computeWebhookSignature
@@ -78,6 +129,27 @@ describe('computeWebhookSignature', () => {
     expect(sig).toBe(
       'sha256=0329a06b62cd16b33eb6792be8c60b158d89a2ee3a876fce9a881ebb488c0914',
     );
+  });
+});
+
+describe('verifyWebhookSignature', () => {
+  it('accepts a signature generated from the raw body', () => {
+    const body = '{"schema_version":"1"}';
+    const signature = computeWebhookSignature(body, 'secret');
+
+    expect(verifyWebhookSignature(body, signature, 'secret')).toBe(true);
+  });
+
+  it('rejects a changed body or secret', () => {
+    const body = '{"schema_version":"1"}';
+    const signature = computeWebhookSignature(body, 'secret');
+
+    expect(verifyWebhookSignature('{"schema_version":"2"}', signature, 'secret')).toBe(false);
+    expect(verifyWebhookSignature(body, signature, 'wrong-secret')).toBe(false);
+  });
+
+  it('rejects malformed signatures without throwing', () => {
+    expect(verifyWebhookSignature('body', 'sha256=short', 'secret')).toBe(false);
   });
 });
 
@@ -197,6 +269,65 @@ describe('deliverWebhook', () => {
     expect(result.sent).toBe(false);
   });
 
+  it('aborts a delayed HTTP response when the configured timeout elapses', async () => {
+    const server = await startDelayedWebhookServer();
+    try {
+      const deliveryPromise = deliverWebhook(
+        makePayload(),
+        { ...CONFIG, webhookUrl: server.url, timeoutMs: 250 },
+      );
+      await server.requestReceived;
+      const result = await deliveryPromise;
+
+      expect(result.sent).toBe(false);
+      expect(result.error).toBeDefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('aborts an in-flight delayed HTTP response when its parent signal fires', async () => {
+    const server = await startDelayedWebhookServer();
+    const controller = new AbortController();
+    try {
+      const deliveryPromise = deliverWebhook(
+        makePayload(),
+        {
+          ...CONFIG,
+          webhookUrl: server.url,
+          timeoutMs: 5_000,
+          signal: controller.signal,
+        },
+      );
+      await server.requestReceived;
+      controller.abort(new Error('job cancelled'));
+      const result = await deliveryPromise;
+
+      expect(result.sent).toBe(false);
+      expect(result.error).toContain('job cancelled');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('bridges runner SIGINT and SIGTERM into an abort signal and unregisters listeners', () => {
+    const signalSource = Object.assign(new EventEmitter(), {
+      exitCode: undefined as number | undefined,
+    });
+    const controller = new AbortController();
+    const removeListeners = listenForRunnerCancellation(controller, signalSource as any);
+
+    signalSource.emit('SIGTERM');
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(controller.signal.reason.message).toContain('SIGTERM');
+    expect(signalSource.exitCode).toBe(143);
+
+    removeListeners();
+    expect(signalSource.listenerCount('SIGINT')).toBe(0);
+    expect(signalSource.listenerCount('SIGTERM')).toBe(0);
+  });
+
   it('sends to the correct URL', async () => {
     const mockFetch = jest.fn().mockResolvedValue({ status: 204 });
     await deliverWebhook(makePayload(), CONFIG, mockFetch as any);
@@ -225,7 +356,7 @@ describe('deliverWebhook', () => {
 
     await deliverWebhook(makePayload(), CONFIG, mockFetch as any);
 
-    const expected = computeWebhookSignature(capturedBody!, CONFIG.webhookSecret);
+    const expected = computeWebhookSignature(capturedBody!, CONFIG.webhookSecret!);
     expect(capturedHeaders!['X-TrustBridge-Signature']).toBe(expected);
   });
 });
@@ -258,5 +389,88 @@ describe('sendWebhookNotification', () => {
       sendWebhookNotification(passedResult, ADDRESS, CONFIG, 'owner/repo', 5),
     ).resolves.toBeUndefined();
     (global as any).fetch = origFetch;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Golden fixture alignment (Issue #326)
+// ---------------------------------------------------------------------------
+
+describe('golden fixture — webhook-payload.json', () => {
+  it('fixture file is valid JSON and can be read', () => {
+    expect(() => JSON.parse(fs.readFileSync(FIXTURE_PATH, 'utf8'))).not.toThrow();
+  });
+
+  it('fixture has schema_version "1"', () => {
+    expect(goldenFixture.schema_version).toBe('1');
+  });
+
+  it('fixture has event "validation_complete"', () => {
+    expect(goldenFixture.event).toBe('validation_complete');
+  });
+
+  it('fixture stellar_address is redacted (first4...last4 format)', () => {
+    expect(goldenFixture.stellar_address).toMatch(/^[GC][A-Z2-7]{3}\.{3}[A-Z2-7]{4}$/);
+  });
+
+  it('fixture result has all required boolean fields', () => {
+    expect(typeof goldenFixture.result.valid).toBe('boolean');
+    expect(typeof goldenFixture.result.account_funded).toBe('boolean');
+    expect(typeof goldenFixture.result.trustline_exists).toBe('boolean');
+  });
+
+  it('fixture result.xlm_balance is a string', () => {
+    expect(typeof goldenFixture.result.xlm_balance).toBe('string');
+  });
+
+  it('fixture result.checks is an array of {label, passed} objects', () => {
+    expect(Array.isArray(goldenFixture.result.checks)).toBe(true);
+    for (const check of goldenFixture.result.checks) {
+      expect(typeof check.label).toBe('string');
+      expect(typeof check.passed).toBe('boolean');
+      // checks in the payload must NOT include the internal 'detail' field
+      expect(Object.keys(check)).toEqual(expect.arrayContaining(['label', 'passed']));
+      expect('detail' in check).toBe(false);
+    }
+  });
+
+  it('fixture issue_number is a number or null', () => {
+    expect(
+      goldenFixture.issue_number === null || typeof goldenFixture.issue_number === 'number',
+    ).toBe(true);
+  });
+
+  it('buildWebhookPayload output matches fixture schema shape', () => {
+    const payload = buildWebhookPayload(passedResult, ADDRESS, 'owner/repo', 42);
+
+    // Structural keys must match exactly
+    expect(Object.keys(payload).sort()).toEqual(Object.keys(goldenFixture).sort());
+    expect(Object.keys(payload.result).sort()).toEqual(Object.keys(goldenFixture.result).sort());
+
+    // Types must match
+    expect(payload.schema_version).toBe(goldenFixture.schema_version);
+    expect(payload.event).toBe(goldenFixture.event);
+    expect(typeof payload.timestamp).toBe('string');
+    expect(typeof payload.repository).toBe('string');
+    expect(payload.issue_number).toBe(42);
+    expect(payload.stellar_address).toMatch(/^[GC][A-Z2-7]{3}\.{3}[A-Z2-7]{4}$/);
+    expect(typeof payload.result.valid).toBe('boolean');
+    expect(typeof payload.result.account_funded).toBe('boolean');
+    expect(typeof payload.result.trustline_exists).toBe('boolean');
+    expect(typeof payload.result.xlm_balance).toBe('string');
+    expect(Array.isArray(payload.result.checks)).toBe(true);
+  });
+
+  it('buildWebhookPayload checks have no extra fields beyond label and passed', () => {
+    const payload = buildWebhookPayload(passedResult, ADDRESS, 'owner/repo', 42);
+    for (const check of payload.result.checks) {
+      expect(Object.keys(check).sort()).toEqual(['label', 'passed'].sort());
+    }
+  });
+
+  it('fixture timestamp is valid ISO-8601', () => {
+    const d = new Date(goldenFixture.timestamp);
+    expect(isNaN(d.getTime())).toBe(false);
+    expect(d.toISOString()).toBe(goldenFixture.timestamp);
   });
 });

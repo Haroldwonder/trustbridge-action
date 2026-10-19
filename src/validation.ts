@@ -391,6 +391,12 @@ export const SSRF_BLOCKED_PATTERNS: RegExp[] = [
   // IPv6 loopback / link-local
   /^https?:\/\/\[?::1\]?/,
   /^https?:\/\/\[?fe80:/i,
+  // IPv4-mapped IPv6 addresses (e.g., ::ffff:127.0.0.1, ::ffff:192.168.1.1)
+  /^https?:\/\/\[?::ffff:(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/i,
+  // IPv6 ULA (Unique Local Addresses: fc00::/7 — private equivalent of RFC1918)
+  /^https?:\/\/\[?f[cd][0-9a-f]{2}:/i,
+  // IPv6 loopback with zone ID (e.g., ::1%eth0)
+  /^https?:\/\/\[?::1[%]/,
   // Bare "localhost"
   /^https?:\/\/localhost[:/]/i,
   /^https?:\/\/localhost$/i,
@@ -411,7 +417,7 @@ export const SSRF_BLOCKED_PATTERNS: RegExp[] = [
 export function validateSsrfSafeUrl(
   url: string,
   fieldName: string,
-  options: { allowHttp?: boolean } = {},
+  options: { allowHttp?: boolean; allowLocalhost?: boolean } = {},
 ): ValidationResult {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -444,6 +450,9 @@ export function validateSsrfSafeUrl(
 
   // SSRF pattern check — run against credential-stripped URL
   for (const pattern of SSRF_BLOCKED_PATTERNS) {
+    if (options.allowLocalhost && /^https?:\/\/localhost(?::|\/|$)/i.test(strippedUrl) && pattern.source.includes('localhost')) {
+      continue;
+    }
     if (pattern.test(strippedUrl)) {
       errors.push(
         `${fieldName} targets a blocked address (private IP, loopback, or metadata endpoint): "${trimmed}"`,
@@ -471,7 +480,7 @@ export function validateSsrfSafeUrl(
 export function validateHorizonUrl(
   url: string,
   fieldName = 'horizon_url',
-  options: { allowHttp?: boolean } = {},
+  options: { allowHttp?: boolean; allowlist?: string[]; allowLocalhost?: boolean } = {},
 ): ValidationResult {
   // Allow http by default (testnet / private mirrors); pass allowHttp:false for https-only.
   const allowHttp = options.allowHttp !== false;
@@ -488,7 +497,10 @@ export function validateHorizonUrl(
     errors.push(`${fieldName} must not contain path traversal segments ("..") or invalid path dots`);
   }
 
-  const ssrf = validateSsrfSafeUrl(url, fieldName, { allowHttp });
+  const ssrf = validateSsrfSafeUrl(url, fieldName, {
+    allowHttp,
+    allowLocalhost: options.allowLocalhost,
+  });
   const urlCheck = validateUrl(url, fieldName, {
     protocols: allowHttp ? ['http', 'https'] : ['https'],
   });
@@ -498,6 +510,41 @@ export function validateHorizonUrl(
   }
   for (const w of [...urlCheck.warnings, ...ssrf.warnings]) {
     if (!warnings.includes(w)) warnings.push(w);
+  }
+
+  // Issue #315: Strict allowlist check
+  if (options.allowlist && options.allowlist.length > 0 && urlCheck.valid) {
+    try {
+      const parsedTarget = new URL(trimmed);
+      const targetHost = parsedTarget.host.toLowerCase();
+
+      let matched = false;
+      for (const allowed of options.allowlist) {
+        const cleanAllowed = allowed.trim();
+        if (!cleanAllowed) continue;
+
+        try {
+          // If the allowlist entry is a full URL, parse and compare hosts
+          const parsedAllowed = new URL(cleanAllowed);
+          if (targetHost === parsedAllowed.host.toLowerCase()) {
+            matched = true;
+            break;
+          }
+        } catch {
+          // If the allowlist entry is just a hostname/port
+          if (targetHost === cleanAllowed.toLowerCase() || parsedTarget.hostname.toLowerCase() === cleanAllowed.toLowerCase()) {
+            matched = true;
+            break;
+          }
+        }
+      }
+
+      if (!matched) {
+        errors.push(`${fieldName} host "${targetHost}" is not in the allowlist`);
+      }
+    } catch {
+      // Ignore URL parse errors here, let urlCheck handle invalid format
+    }
   }
 
   const normalizedErrors = errors.map((e) => {

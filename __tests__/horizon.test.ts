@@ -3,7 +3,10 @@ import { HorizonError, HorizonRateLimitError, isCreditBalance,
   parseRetryAfterMs,
   fetchNetworkPassphrase, FetchLike,
   parseHorizonBalance, normalizeHorizonUrl, getAssetBalance } from '../src/horizon';
-import { fetchAccount, HorizonAccount, waitForFundedAccount, getNativeBalance, hasTrustline } from '../src/horizon';
+import { fetchAccount, HorizonAccount, waitForFundedAccount, getNativeBalance, hasTrustline, fetchClaimableBalanceCount } from '../src/horizon';
+import { applyWalletLabels, applyReadyLabels } from '../src/horizon';
+import { HorizonCircuitOpenError, isCircuitOpenError } from '../src/horizon';
+import { CircuitBreaker, CircuitOpenError } from '../src/resilience';
 import * as loggerModule from '../src/logger';
 import { SimpleCache } from '../src/cache';
 import type { Request, RequestInit, Response } from 'node-fetch';
@@ -534,7 +537,7 @@ describe('Horizon debug log redaction', () => {
       }
     });
 
-    it('throws HorizonRateLimitError if total wait exceeds max total wait', async () => {
+    it('reports wait-budget context if total wait exceeds max total wait', async () => {
       const errBody = { type: 'rate_limit', title: 'Too Many Requests', status: 429, detail: `Rate limited` };
       let callCount = 0;
       const mock = makeMockFetch(async () => {
@@ -553,7 +556,7 @@ describe('Horizon debug log redaction', () => {
           retryMaxDelayMs: 60000, // per-retry cap is generous enough
           retryMaxTotalWaitMs: 70000, // but total wait cap will be exceeded on 2nd retry (40k + 40k = 80k > 70k)
           fetchFn: mock,
-        })).rejects.toThrow(HorizonRateLimitError);
+        })).rejects.toThrow(/retry wait budget exhausted/i);
         // It should have made 2 calls (first attempt + 1 retry, before failing before 2nd retry)
         expect(mock).toHaveBeenCalledTimes(2);
       } finally {
@@ -1183,5 +1186,518 @@ describe('AbortSignal cancellation', () => {
       expect(result).toBeDefined();
       expect(callCount).toBe(2);
     });
+  });
+});
+
+describe('fetchClaimableBalanceCount', () => {
+  it('returns 0 on validation error', async () => {
+    const result = await fetchClaimableBalanceCount('http://169.254.169.254', 'G123', jest.fn() as any);
+    expect(result).toBe(0);
+  });
+
+  it('returns 0 on fetch error', async () => {
+    const fetchFn = jest.fn().mockRejectedValue(new Error('Network error'));
+    const result = await fetchClaimableBalanceCount('https://horizon.stellar.org', 'G123', fetchFn as any);
+    expect(result).toBe(0);
+  });
+
+  it('returns 0 on non-ok response', async () => {
+    const fetchFn = jest.fn().mockResolvedValue({ ok: false });
+    const result = await fetchClaimableBalanceCount('https://horizon.stellar.org', 'G123', fetchFn as any);
+    expect(result).toBe(0);
+  });
+
+  it('returns 0 when the claimant endpoint responds with 404', async () => {
+    const fetchFn = jest.fn().mockResolvedValue({ ok: false, status: 404 });
+    const result = await fetchClaimableBalanceCount(PRIMARY_HORIZON, TEST_ADDRESS, fetchFn as any);
+    expect(result).toBe(0);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns count when _embedded.records is populated', async () => {
+    const fetchFn = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ _embedded: { records: [1, 2, 3] } }),
+    });
+    const result = await fetchClaimableBalanceCount(PRIMARY_HORIZON, TEST_ADDRESS, fetchFn as any);
+    expect(result).toBe(3);
+    expect(fetchFn).toHaveBeenCalledWith(
+      `${PRIMARY_HORIZON}/claimable_balances?claimant=${encodeURIComponent(TEST_ADDRESS)}&limit=5`,
+      expect.objectContaining({ method: 'GET' }),
+    );
+  });
+
+  it('returns count when records is populated directly', async () => {
+    const fetchFn = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ records: [1] }),
+    });
+    const result = await fetchClaimableBalanceCount('https://horizon.stellar.org', 'G123', fetchFn as any);
+    expect(result).toBe(1);
+  });
+
+  it('returns 0 when records is empty', async () => {
+    const fetchFn = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ records: [] }),
+    });
+    const result = await fetchClaimableBalanceCount('https://horizon.stellar.org', 'G123', fetchFn as any);
+    expect(result).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #434 — circuit-open propagation
+// ---------------------------------------------------------------------------
+
+describe('circuit-open propagation (Issue #434)', () => {
+  it('throws HorizonCircuitOpenError when the breaker blocks the request', async () => {
+    const breaker = new CircuitBreaker({ failureThreshold: 1, recoveryTimeoutMs: 60_000 });
+    // Trip the breaker with one failure. The tripping call rethrows the
+    // original error; the *next* call is the fast-fail.
+    await expect(
+      breaker.execute(async () => {
+        throw new Error('boom');
+      }),
+    ).rejects.toThrow('boom');
+
+    // The next call is fast-failed without touching the network.
+    const fetchFn = jest.fn();
+    await expect(
+      fetchAccount(PRIMARY_HORIZON, TEST_ADDRESS, {
+        fetchFn: fetchFn as unknown as FetchLike,
+        cacheTtlMs: 0,
+        circuitBreaker: breaker,
+      }),
+    ).rejects.toThrow(HorizonCircuitOpenError);
+
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+
+  it('keeps HorizonCircuitOpenError a HorizonError so existing handlers still work', () => {
+    const err = new HorizonCircuitOpenError('blocked');
+    expect(err).toBeInstanceOf(HorizonError);
+    expect(err.statusCode).toBe(0);
+    expect(err.retryable).toBe(false);
+  });
+
+  it('detects circuit-open errors across both representations', () => {
+    expect(isCircuitOpenError(new HorizonCircuitOpenError('x'))).toBe(true);
+    expect(isCircuitOpenError(new CircuitOpenError('x'))).toBe(true);
+    expect(isCircuitOpenError(new HorizonError('x', 500))).toBe(false);
+    expect(isCircuitOpenError(new Error('x'))).toBe(false);
+    expect(isCircuitOpenError(undefined)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #694 — paginate applyWalletLabels beyond the 100-label-per-page cap
+// ---------------------------------------------------------------------------
+
+/** Build an octokit mock that serves `listLabelsOnIssue` page by page. */
+function makeLabelOctokit(pages: Array<Array<{ name: string }>>) {
+  const listLabelsOnIssue = jest.fn((params: { page?: number }) => {
+    const page = params.page ?? 1;
+    return Promise.resolve({ data: pages[page - 1] ?? [] });
+  });
+  const addLabels = jest.fn().mockResolvedValue({});
+  const removeLabel = jest.fn().mockResolvedValue({});
+  return {
+    octokit: { rest: { issues: { listLabelsOnIssue, addLabels, removeLabel } } },
+    listLabelsOnIssue,
+    addLabels,
+    removeLabel,
+  };
+}
+
+/** Build a paginated label fixture of `total` labels, overriding given slots. */
+function buildPagedLabels(
+  total: number,
+  overrides: Array<{ slot: number; name: string }>,
+  perPage = 100,
+): Array<Array<{ name: string }>> {
+  const names = Array.from({ length: total }, (_, i) => `label: ${i + 1}`);
+  for (const { slot, name } of overrides) {
+    names[slot] = name;
+  }
+  const pages: Array<Array<{ name: string }>> = [];
+  for (let i = 0; i < names.length; i += perPage) {
+    pages.push(names.slice(i, i + perPage).map((name) => ({ name })));
+  }
+  return pages;
+}
+
+describe('applyWalletLabels pagination (Issue #694)', () => {
+  const OWNER = 'trustbridge';
+  const REPO = 'wallet-repo';
+  const ISSUE = 1337;
+
+  it('applies the wallet label when it only exists on page 2 of a >100-label issue', async () => {
+    // 250 labels: pages [100, 100, 50]. Target label sits on page 2.
+    const pages = buildPagedLabels(250, [{ slot: 150, name: 'wallet: funded' }]);
+    const { octokit, listLabelsOnIssue, addLabels, removeLabel } =
+      makeLabelOctokit(pages);
+
+    const result = await applyWalletLabels(octokit as any, OWNER, REPO, ISSUE, {
+      accountFunded: true,
+      trustlineExists: true,
+      xlmReserveMet: true,
+    });
+
+    expect(result).toEqual({ applied: 'wallet: funded', removed: [] });
+    // The loop walked pages 1, 2 and stopped on the short page 3.
+    expect(listLabelsOnIssue).toHaveBeenCalledTimes(3);
+    expect(listLabelsOnIssue).toHaveBeenLastCalledWith(
+      expect.objectContaining({ page: 3, per_page: 100 }),
+    );
+    // Label already present → no duplicate create attempt.
+    expect(addLabels).not.toHaveBeenCalled();
+    expect(removeLabel).not.toHaveBeenCalled();
+  });
+
+  it('removes a stale wallet label found on page 3 and adds the missing target', async () => {
+    const pages = buildPagedLabels(250, [{ slot: 220, name: 'wallet: unfunded' }]);
+    const { octokit, listLabelsOnIssue, addLabels, removeLabel } =
+      makeLabelOctokit(pages);
+
+    const result = await applyWalletLabels(octokit as any, OWNER, REPO, ISSUE, {
+      accountFunded: true,
+      trustlineExists: true,
+      xlmReserveMet: true,
+    });
+
+    expect(result).toEqual({
+      applied: 'wallet: funded',
+      removed: ['wallet: unfunded'],
+    });
+    expect(removeLabel).toHaveBeenCalledTimes(1);
+    expect(removeLabel).toHaveBeenCalledWith({
+      owner: OWNER,
+      repo: REPO,
+      issue_number: ISSUE,
+      name: 'wallet: unfunded',
+    });
+    // Target not present anywhere → added exactly once.
+    expect(addLabels).toHaveBeenCalledTimes(1);
+    expect(addLabels).toHaveBeenCalledWith({
+      owner: OWNER,
+      repo: REPO,
+      issue_number: ISSUE,
+      labels: ['wallet: funded'],
+    });
+    expect(listLabelsOnIssue).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not re-add the target when removeStale=false and the target is on page 2', async () => {
+    const pages = buildPagedLabels(250, [
+      { slot: 150, name: 'wallet: trustline-missing' },
+    ]);
+    const { octokit, addLabels, removeLabel } = makeLabelOctokit(pages);
+
+    const result = await applyWalletLabels(
+      octokit as any,
+      OWNER,
+      REPO,
+      ISSUE,
+      { accountFunded: true, trustlineExists: false, xlmReserveMet: false },
+      { removeStale: false },
+    );
+
+    expect(result).toEqual({ applied: 'wallet: trustline-missing', removed: [] });
+    expect(addLabels).not.toHaveBeenCalled();
+    expect(removeLabel).not.toHaveBeenCalled();
+  });
+
+  it('terminates the loop with one empty page when the label count is an exact multiple of 100', async () => {
+    // 300 labels = three full 100-label pages; page 4 is empty and ends the loop.
+    const pages = buildPagedLabels(300, []);
+    const { octokit, listLabelsOnIssue, addLabels } = makeLabelOctokit(pages);
+
+    const result = await applyWalletLabels(octokit as any, OWNER, REPO, ISSUE, {
+      accountFunded: true,
+      trustlineExists: true,
+      xlmReserveMet: true,
+    });
+
+    expect(listLabelsOnIssue).toHaveBeenCalledTimes(4);
+    expect(addLabels).toHaveBeenCalledTimes(1);
+    expect(addLabels).toHaveBeenCalledWith({
+      owner: OWNER,
+      repo: REPO,
+      issue_number: ISSUE,
+      labels: ['wallet: funded'],
+    });
+    expect(result.applied).toBe('wallet: funded');
+  });
+
+  it('attempts to add a missing label and surfaces add failures as an error', async () => {
+    const pages = buildPagedLabels(250, []);
+    const { octokit, addLabels, removeLabel } = makeLabelOctokit(pages);
+    addLabels.mockRejectedValue(new Error('add label failed'));
+
+    const result = await applyWalletLabels(octokit as any, OWNER, REPO, ISSUE, {
+      accountFunded: true,
+      trustlineExists: true,
+      xlmReserveMet: true,
+    });
+
+    expect(addLabels).toHaveBeenCalledTimes(1);
+    expect(removeLabel).not.toHaveBeenCalled();
+    expect(result.applied).toBe('wallet: funded');
+    expect(result.removed).toEqual([]);
+    expect(result.error).toContain('add label failed');
+  });
+
+  it('surfaces listing errors instead of swallowing them', async () => {
+    const { octokit, addLabels, listLabelsOnIssue } = makeLabelOctokit([]);
+    listLabelsOnIssue.mockRejectedValue(new Error('list labels failed'));
+
+    const result = await applyWalletLabels(octokit as any, OWNER, REPO, ISSUE, {
+      accountFunded: true,
+      trustlineExists: true,
+      xlmReserveMet: true,
+    });
+
+    expect(result.applied).toBe('wallet: funded');
+    expect(result.error).toContain('list labels failed');
+    expect(addLabels).not.toHaveBeenCalled();
+  });
+});
+
+describe('applyReadyLabels pagination (Issue #694)', () => {
+  it('sees stale labels on later pages and does not duplicate the target', async () => {
+    const pages = buildPagedLabels(250, [
+      { slot: 120, name: 'trustbridge: fail' },
+      { slot: 125, name: 'trustbridge: pass' },
+    ]);
+    const { octokit, listLabelsOnIssue, addLabels, removeLabel } =
+      makeLabelOctokit(pages);
+
+    const result = await applyReadyLabels(octokit as any, 'owner', 'repo', 42, {
+      ready: true,
+      passLabel: 'trustbridge: pass',
+      failLabel: 'trustbridge: fail',
+    });
+
+    expect(result).toEqual({
+      applied: 'trustbridge: pass',
+      removed: ['trustbridge: fail'],
+    });
+    expect(listLabelsOnIssue).toHaveBeenCalledTimes(3);
+    expect(removeLabel).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      issue_number: 42,
+      name: 'trustbridge: fail',
+    });
+    // Target already on page 2 → no duplicate add attempt.
+    expect(addLabels).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #558 — Hardened Horizon mock fixtures: clawback and auth_required
+// ---------------------------------------------------------------------------
+describe('HorizonBalanceCredit: clawback and auth_required fixture assertions', () => {
+  it('accepts a credit balance with is_clawback_enabled=true', () => {
+    const balance: import('../src/horizon').HorizonBalanceCredit = {
+      balance: '5.0000000',
+      asset_type: 'credit_alphanum4',
+      asset_code: 'USDC',
+      asset_issuer: TEST_ADDRESS_2,
+      buying_liabilities: '0.0000000',
+      selling_liabilities: '0.0000000',
+      is_clawback_enabled: true,
+    };
+    expect(balance.is_clawback_enabled).toBe(true);
+    expect(isCreditBalance(balance)).toBe(true);
+  });
+
+  it('accepts a credit balance with is_clawback_enabled=false (issuer opted out)', () => {
+    const balance: import('../src/horizon').HorizonBalanceCredit = {
+      balance: '5.0000000',
+      asset_type: 'credit_alphanum4',
+      asset_code: 'USDC',
+      asset_issuer: TEST_ADDRESS_2,
+      buying_liabilities: '0.0000000',
+      selling_liabilities: '0.0000000',
+      is_clawback_enabled: false,
+    };
+    expect(balance.is_clawback_enabled).toBe(false);
+  });
+
+  it('accepts a credit balance with is_authorized=true (issuer has AUTH_REQUIRED)', () => {
+    const balance: import('../src/horizon').HorizonBalanceCredit = {
+      balance: '5.0000000',
+      asset_type: 'credit_alphanum4',
+      asset_code: 'USDC',
+      asset_issuer: TEST_ADDRESS_2,
+      buying_liabilities: '0.0000000',
+      selling_liabilities: '0.0000000',
+      is_authorized: true,
+      is_authorized_to_maintain_liabilities: true,
+    };
+    expect(balance.is_authorized).toBe(true);
+    expect(balance.is_authorized_to_maintain_liabilities).toBe(true);
+  });
+
+  it('accepts a credit balance with is_authorized=false (frozen / not yet authorized)', () => {
+    const balance: import('../src/horizon').HorizonBalanceCredit = {
+      balance: '0.0000000',
+      asset_type: 'credit_alphanum4',
+      asset_code: 'USDC',
+      asset_issuer: TEST_ADDRESS_2,
+      buying_liabilities: '0.0000000',
+      selling_liabilities: '0.0000000',
+      is_authorized: false,
+      is_authorized_to_maintain_liabilities: false,
+    };
+    expect(balance.is_authorized).toBe(false);
+  });
+
+  it('accepts a credit balance with both clawback and auth flags set', () => {
+    const balance: import('../src/horizon').HorizonBalanceCredit = {
+      balance: '1.0000000',
+      asset_type: 'credit_alphanum4',
+      asset_code: 'USDC',
+      asset_issuer: TEST_ADDRESS_2,
+      buying_liabilities: '0.0000000',
+      selling_liabilities: '0.0000000',
+      is_authorized: true,
+      is_authorized_to_maintain_liabilities: true,
+      is_clawback_enabled: true,
+    };
+    expect(balance.is_authorized).toBe(true);
+    expect(balance.is_clawback_enabled).toBe(true);
+  });
+
+  it('omits optional auth/clawback fields gracefully (backward-compatible fixture)', () => {
+    const balance: import('../src/horizon').HorizonBalanceCredit = {
+      balance: '5.0000000',
+      asset_type: 'credit_alphanum4',
+      asset_code: 'USDC',
+      asset_issuer: TEST_ADDRESS_2,
+      buying_liabilities: '0.0000000',
+      selling_liabilities: '0.0000000',
+      // is_authorized, is_clawback_enabled intentionally absent
+    };
+    expect(balance.is_authorized).toBeUndefined();
+    expect(balance.is_clawback_enabled).toBeUndefined();
+    expect(isCreditBalance(balance)).toBe(true);
+  });
+});
+
+describe('HorizonAccount: account-level flags fixture assertions', () => {
+  it('accepts an account with auth_required=true in flags', () => {
+    const account: import('../src/horizon').HorizonAccount = {
+      ...makeAccount(),
+      flags: {
+        auth_required: true,
+        auth_revocable: true,
+        auth_immutable: false,
+        auth_clawback_enabled: false,
+      },
+    };
+    expect(account.flags?.auth_required).toBe(true);
+    expect(account.flags?.auth_revocable).toBe(true);
+    expect(account.flags?.auth_immutable).toBe(false);
+    expect(account.flags?.auth_clawback_enabled).toBe(false);
+  });
+
+  it('accepts an account with auth_clawback_enabled=true in flags', () => {
+    const account: import('../src/horizon').HorizonAccount = {
+      ...makeAccount(),
+      flags: {
+        auth_required: true,
+        auth_revocable: true,
+        auth_clawback_enabled: true,
+      },
+    };
+    expect(account.flags?.auth_clawback_enabled).toBe(true);
+  });
+
+  it('accepts an account without flags field (older Horizon snapshot)', () => {
+    const account = makeAccount();
+    expect(account.flags).toBeUndefined();
+    // hasTrustline should still work regardless
+    expect(hasTrustline(account, 'USDC', TEST_ADDRESS_2)).toBe(true);
+  });
+
+  it('hasTrustline returns true even when trustline has is_clawback_enabled set', () => {
+    const account: import('../src/horizon').HorizonAccount = {
+      ...makeAccount(),
+      balances: [
+        {
+          balance: '10.0000000',
+          asset_type: 'native',
+          buying_liabilities: '0.0000000',
+          selling_liabilities: '0.0000000',
+        },
+        {
+          balance: '5.0000000',
+          asset_type: 'credit_alphanum4',
+          asset_code: 'USDC',
+          asset_issuer: TEST_ADDRESS_2,
+          buying_liabilities: '0.0000000',
+          selling_liabilities: '0.0000000',
+          is_clawback_enabled: true,
+          is_authorized: true,
+          is_authorized_to_maintain_liabilities: true,
+        },
+      ],
+    };
+    expect(hasTrustline(account, 'USDC', TEST_ADDRESS_2)).toBe(true);
+  });
+
+  it('fetchAccount round-trips a fixture containing clawback and auth flags', async () => {
+    const accountWithFlags: import('../src/horizon').HorizonAccount = {
+      id: TEST_ADDRESS,
+      account_id: TEST_ADDRESS,
+      sequence: '1',
+      subentry_count: 2,
+      num_sponsoring: 0,
+      num_sponsored: 0,
+      flags: {
+        auth_required: true,
+        auth_revocable: true,
+        auth_clawback_enabled: true,
+      },
+      balances: [
+        {
+          balance: '10.0000000',
+          asset_type: 'native',
+          buying_liabilities: '0.0000000',
+          selling_liabilities: '0.0000000',
+        },
+        {
+          balance: '5.0000000',
+          asset_type: 'credit_alphanum4',
+          asset_code: 'USDC',
+          asset_issuer: TEST_ADDRESS_2,
+          buying_liabilities: '0.0000000',
+          selling_liabilities: '0.0000000',
+          is_authorized: true,
+          is_authorized_to_maintain_liabilities: true,
+          is_clawback_enabled: true,
+        },
+      ],
+    };
+    const mock = makeMockFetch(async () => makeMockResponse(200, accountWithFlags));
+
+    const result = await fetchAccount(PRIMARY_HORIZON, TEST_ADDRESS, {
+      maxRetries: 0,
+      cacheTtlMs: 0,
+      fetchFn: mock,
+    });
+
+    expect(result.flags?.auth_required).toBe(true);
+    expect(result.flags?.auth_clawback_enabled).toBe(true);
+    const usdcBalance = result.balances.find(
+      (b) => isCreditBalance(b) && b.asset_code === 'USDC',
+    ) as import('../src/horizon').HorizonBalanceCredit | undefined;
+    expect(usdcBalance).toBeDefined();
+    expect(usdcBalance?.is_clawback_enabled).toBe(true);
+    expect(usdcBalance?.is_authorized).toBe(true);
   });
 });

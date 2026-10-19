@@ -1,7 +1,7 @@
-import * as core from '@actions/core';
-import * as fs from 'fs';
-import * as path from 'path';
-import * as github from '@actions/github';
+import * as core from "@actions/core";
+import * as fs from "fs";
+import * as path from "path";
+import * as github from "@actions/github";
 import {
   CheckConfig,
   STELLAR_BASE_RESERVE_XLM,
@@ -9,7 +9,7 @@ import {
   buildValidationGate,
   ValidationResult,
   estimateTrustlineSetupCost,
-} from './checks';
+} from "./checks";
 import {
   buildAccountViewerLink,
   buildChangeTrustLink,
@@ -19,7 +19,16 @@ import {
   inferStellarNetwork,
   buildFaqLinkForCheck,
 } from './links';
-import { buildOnboardingChecklist, inlineCode } from './markdown';
+import {
+  buildOnboardingChecklist,
+  buildAssetTrustlineTable,
+  escapeMarkdownInline,
+  extractChecklistState,
+  inlineCode,
+  type AssetTrustlineRow,
+} from './markdown';
+import { buildTemplateContext, loadCommentTemplate } from './template';
+import { getOctokitProxyOptions } from './proxy';
 import { MetricsCollector } from './metrics';
 import {
   formatSnoozeMarker,
@@ -31,6 +40,8 @@ import {
 import { buildDiagnosticsBlock, DiagnosticsConfig } from './diagnostics';
 import { Locale, getStrings } from './i18n';
 import { formatDeltaMarkdown, ValidationDelta } from './delta';
+import { traceCommentPost } from './tracing';
+import { redactStellarAddress } from './logger';
 
 /**
  * Semantic schema version embedded in every TrustBridge issue comment.
@@ -38,7 +49,7 @@ import { formatDeltaMarkdown, ValidationDelta } from './delta';
  * shape, etc.) changes in a way that downstream consumers or future
  * versions of this action need to detect.
  */
-export const COMMENT_SCHEMA_VERSION = '1.1.0';
+export const COMMENT_SCHEMA_VERSION = "1.1.0";
 
 export interface CommentConfig extends CheckConfig {
   stellarAddress: string;
@@ -104,16 +115,51 @@ export interface CommentConfig extends CheckConfig {
    */
   sep0010ChallengeXdr?: string;
   sep0010DashboardUrl?: string;
+  /**
+   * Optional workspace-relative (or absolute) path to a Markdown partial
+   * file that is appended to the comment just before the footer (#312).
+   *
+   * The partial supports `{{variable}}` interpolation for safe substitution
+   * of account, asset, issuer, network, horizon, status, and i18n strings
+   * (`{{locale:KEY}}`). All substituted values are escaped through
+   * `escapeMarkdownInline` to prevent Markdown injection. Dangerous patterns
+   * (prototype-chain keys, <script>, javascript:, inline event handlers) are
+   * rejected before interpolation. The file must reside inside the workspace
+   * root (path traversal is blocked) and must not exceed 8 KB.
+   *
+   * Leave unset or empty to disable the feature entirely.
+   */
+  customCommentTemplatePath?: string;
+  /**
+   * Per-asset trustline status for the `assets_json` input (Issue #552).
+   * When non-empty, a per-asset breakdown table is rendered after the
+   * Balances section so the comment matches the behaviour documented in
+   * `action.yml` for `assets_trustline_status` / `trustlines_summary`.
+   * Leave undefined/empty to omit the section (single-asset runs).
+   */
+  assets?: AssetTrustlineRow[];
+  existingCommentBody?: string;
+  /**
+   * When true, redact Stellar addresses (G‑ and C‑addresses) in the comment
+   * body using the same redaction format as log output (`redactStellarAddress`
+   * from `logger.ts`). SEP-0007 wallet deep links are omitted because they
+   * require the full destination address.
+   *
+   * Matches the `privacy_mode` action input.
+   */
+  privacyMode?: boolean;
 }
 
-export const TRUSTBRIDGE_FOOTER = '_Posted by [trustbridge-action](https://github.com/Stellar-TrustBridge/trustbridge-action)_';
+export const TRUSTBRIDGE_FOOTER =
+  "_Posted by [trustbridge-action](https://github.com/Stellar-TrustBridge/trustbridge-action)_";
 
 /**
  * Legacy hidden marker (pre-schema-version). Kept for backward
  * compatibility in `findStickyComment` so comments posted by older
  * releases of the action are still eligible for upsert.
  */
-export const STICKY_COMMENT_MARKER_LEGACY = '<!-- trustbridge-action:sticky-comment -->';
+export const STICKY_COMMENT_MARKER_LEGACY =
+  "<!-- trustbridge-action:sticky-comment -->";
 
 /**
  * Hidden marker embedded in every TrustBridge comment body. Includes the
@@ -124,11 +170,12 @@ export const STICKY_COMMENT_MARKER_LEGACY = '<!-- trustbridge-action:sticky-comm
 export const STICKY_COMMENT_MARKER = `<!-- trustbridge-action:sticky-comment:schema-v${COMMENT_SCHEMA_VERSION} -->`;
 
 function statusIcon(passed: boolean): string {
-  return passed ? '✅' : '❌';
+  return passed ? "✅" : "❌";
 }
 
 export const MAX_COMMENT_LENGTH = 64000;
-const TRUNCATION_NOTICE = '\n\n_... [Truncated due to GitHub length limits. See workflow logs for full details.]_';
+const TRUNCATION_NOTICE =
+  "\n\n_... [Truncated due to GitHub length limits. See workflow logs for full details.]_";
 
 export function formatCommentBody(
   result: ValidationResult,
@@ -136,284 +183,464 @@ export function formatCommentBody(
 ): string {
   const stellarLabNetwork = inferStellarNetwork(config.horizonUrl);
   const gate = buildValidationGate(result);
-  const strings = getStrings(config.locale ?? 'en');
+  const strings = getStrings(config.locale ?? "en");
   const assetBalanceCheckEnabled = !!config.minAssetBalance;
 
+  // Issue #691 — redact Soroban C‑addresses when privacy mode is on,
+  // using the same `redactStellarAddress` helper as log output.
+  const displayAddress = config.privacyMode
+    ? redactStellarAddress(config.stellarAddress)
+    : config.stellarAddress;
+  const displayIssuer = config.privacyMode
+    ? redactStellarAddress(config.assetIssuer)
+    : config.assetIssuer;
+
   // Generate snooze marker with current check status (Issue #155)
-  const snoozeMarker = formatSnoozeMarker(result.valid ? 'pass' : 'fail');
+  const snoozeMarker = formatSnoozeMarker(result.valid ? "pass" : "fail");
 
   const buildWithRemediation = (remediation: string | undefined): string => {
-  const lines: string[] = [
-    STICKY_COMMENT_MARKER,
-    `<!-- trustbridge-action:schema-version:${COMMENT_SCHEMA_VERSION} -->`,
-    snoozeMarker,
-    '## TrustBridge — Stellar Account Check',
-    '',
-    `${strings.checkedAccount} ${inlineCode(config.stellarAddress)}`,
-    `${strings.horizon} ${inlineCode(config.horizonUrl)}`,
-    `${strings.asset} **${config.assetCode}** · Issuer: ${inlineCode(config.assetIssuer)}`,
-    '',
-    `### ${strings.resultsHeading}`,
-    '',
-  ];
+    // Per-asset trustline table for `assets_json` (Issue #552). Rendered
+    // right after the Balances section so the per-asset state sits next to
+    // the primary asset balance line. When no additional assets are
+    // configured (or all entries were deduplicated) the table is empty and
+    // the comment stays byte-identical to single-asset runs.
+    const assetTable = buildAssetTrustlineTable(config.assets ?? []);
 
-  for (const check of result.checks) {
-    // Append a FAQ deep link for failing checks so contributors land on the
-    // exact fix (Issue #104). Passing checks do not include the link to keep
-    // the happy path clean.
-    let faqSuffix = '';
-    if (!check.passed) {
-      const faqUrl = buildFaqLinkForCheck(check.label, config.docsBaseUrl);
-      if (faqUrl) {
-        faqSuffix = ` [→ FAQ](${faqUrl})`;
+    const lines: string[] = [
+      STICKY_COMMENT_MARKER,
+      `<!-- trustbridge-action:schema-version:${COMMENT_SCHEMA_VERSION} -->`,
+      snoozeMarker,
+      "## TrustBridge — Stellar Account Check",
+      "",
+      `${strings.checkedAccount} ${inlineCode(displayAddress)}`,
+      `${strings.horizon} ${inlineCode(config.horizonUrl)}`,
+      `${strings.asset} **${config.assetCode}** · Issuer: ${inlineCode(displayIssuer)}`,
+    ];
+
+    lines.push(
+      "",
+      `### ${strings.resultsHeading}`,
+      "",
+    );
+
+    for (const check of result.checks) {
+      // Append a FAQ deep link for failing checks so contributors land on the
+      // exact fix (Issue #104). Passing checks do not include the link to keep
+      // the happy path clean.
+      let faqSuffix = "";
+      if (!check.passed) {
+        const faqUrl = buildFaqLinkForCheck(check.label, config.docsBaseUrl);
+        if (faqUrl) {
+          faqSuffix = ` [→ FAQ](${faqUrl})`;
+        }
       }
+      lines.push(
+        `- ${statusIcon(check.passed)} **${check.label}** — ${check.detail}${faqSuffix}`,
+      );
     }
-    lines.push(`- ${statusIcon(check.passed)} **${check.label}** — ${check.detail}${faqSuffix}`);
-  }
 
-  // Onboarding checklist (Issue #154) — default on unless explicitly disabled.
-  if (config.onboardingChecklist !== false) {
+    // Issuer-authorization banner (Issue #729 — unauthorized_trustline_policy).
+    // The trustline check passes in `warn` mode, so without an explicit
+    // banner the only signal is a sentence buried inside a ✅ bullet — triage
+    // cannot tell an informational warning apart from a blocking policy
+    // failure. Warn mode therefore uses a ⚠️ heading and states explicitly
+    // that the run is NOT failed; `fail` mode uses a 🚫 heading and surfaces
+    // the matching `reason_code`. `ignore` renders nothing, matching the
+    // "no additional check or warning" contract of the policy.
+    const unauthorizedPolicy = result.unauthorizedTrustlinePolicy ?? 'warn';
+    if (result.trustlineAuthorized === false && unauthorizedPolicy !== 'ignore') {
+      const blocking = unauthorizedPolicy === 'fail';
+      const authFaqUrl = buildFaqLinkForCheck(
+        `${config.assetCode} trustline`,
+        config.docsBaseUrl,
+      );
+      lines.push(
+        "",
+        `> ${blocking ? '🚫' : '⚠️'} **${escapeMarkdownInline(strings.unauthorizedTrustlineHeading)}**`,
+        `> - ${blocking ? strings.unauthorizedTrustlineFail : strings.unauthorizedTrustlineWarn}`,
+        `> - ${blocking ? strings.unauthorizedTrustlineFailNote : strings.unauthorizedTrustlineWarnNote}`,
+        `> - ${strings.reasonCode} ${inlineCode(blocking ? 'TRUSTLINE_UNAUTHORIZED' : 'SUCCESS')}`,
+        authFaqUrl ? `> - [→ FAQ](${authFaqUrl})` : "",
+      );
+    }
+
+    // Circuit breaker banner (Issue #434) — a run that fast-failed because the
+    // Horizon circuit was open must say so, otherwise the Results list looks
+    // like a plain account failure and triage chases the wrong root cause.
+    // Rendered immediately after Results so it is the first thing a maintainer
+    // reads. Contains no account data, addresses, or balances.
+    if (result.circuitOpen) {      lines.push(
+        "",
+        `> ⚡ **${strings.circuitBreakerHeading}**`,
+        `> - ${strings.circuitBreakerOpen}`,
+        `> - ${strings.circuitBreakerRecoveryHint}`,
+        `> - ${strings.circuitBreakerReasonCode}`,
+      );
+    }
+
+    // Onboarding checklist (Issue #154) — default on unless explicitly disabled.
+    if (config.onboardingChecklist !== false) {
+      // Preserve any manually-checked boxes from the previous sticky comment
+      // (Issue #311).  extractChecklistState parses only the known allowlisted
+      // labels (across every supported locale) so a crafted comment body
+      // cannot inject arbitrary state and a locale switch does not lose state.
+      const previousChecks =
+        config.existingCommentBody
+          ? extractChecklistState(config.existingCommentBody)
+          : undefined;
+
+      lines.push(
+        "",
+        buildOnboardingChecklist(result, {
+          assetCode: config.assetCode,
+          minXlmReserve: config.minXlmReserve,
+          locale: config.locale,
+          previousChecks,
+        }),
+      );
+    }
+
+
+    // Ledger freshness / lag alert (Issue #107) — surfaced as a distinct banner
+    // so contributors clearly understand it is about Horizon data quality, not
+    // their wallet state.
+    if (result.ledgerFreshnessResult) {
+      const fr = result.ledgerFreshnessResult;
+      const icon =
+        fr.status === "ok" ? "✅" : fr.status === "stale" ? "⚠️" : "ℹ️";
+      const lagDisplay =
+        fr.lagSeconds !== null ? `${fr.lagSeconds.toFixed(1)}s` : "_unknown_";
+      const ledgerDisplay =
+        fr.latestLedger !== null ? `#${fr.latestLedger}` : "_unknown_";
+      lines.push(
+        "",
+        `> ${icon} **Ledger freshness** — ${fr.message}`,
+        `> - Measured lag: \`${lagDisplay}\` · Latest ledger: \`${ledgerDisplay}\``,
+        fr.blocksValid
+          ? "> - ❌ This is treated as a **hard failure** (`ledger_freshness_fail_on_stale: true`)."
+          : fr.status === "stale"
+            ? "> - ⚠️ This is an **informational warning** (`ledger_freshness_fail_on_stale: false`). Results may not reflect the current network state."
+            : "",
+      );
+    }
+
+    if (result.networkPassphraseMismatch) {
+      const mismatch = result.networkPassphraseMismatch;
+      lines.push(
+        '',
+        '🚨 **Network passphrase mismatch detected**',
+        `- **Expected:** ${inlineCode(mismatch.expectedPassphrase)}`,
+        `- **Horizon reports:** ${inlineCode(mismatch.actualPassphrase)}`,
+        `- ${mismatch.message}`,
+        '- This is a configuration error and can cause account lookups to return 404 errors.',
+      );
+    }
+
+    const deltaSection = formatDeltaMarkdown(config.delta);
+    if (deltaSection) {
+      lines.push("", deltaSection);
+    }
+
+    // Validation gate (Issue #450) — the machine-readable verdict that the
+    // `ready` / `reason_code` action outputs expose. Surfacing it here means a
+    // dashboard triager can read the reason code straight from the comment
+    // instead of digging through the Actions log.
+    const reasonCode = result.reasonCode ?? (result.valid ? 'SUCCESS' : 'FAILED');
     lines.push(
-      '',
-      buildOnboardingChecklist(result, {
-        assetCode: config.assetCode,
-        minXlmReserve: config.minXlmReserve,
-      }),
+      "",
+      `### ${strings.validationGateHeading}`,
+      "",
+      gate.ready
+        ? `- ${strings.readyToProceed}`
+        : `- ${strings.blockedBy} ${gate.failedLabels.join(", ")}`,
+      `- ${strings.passedChecks} ${gate.passedChecks}/${gate.totalChecks}`,
+      `- ${strings.failedChecks} ${gate.failedChecks}`,
+      `- ${strings.readyFlag} \`${String(gate.ready)}\``,
+      `- ${strings.reasonCode} ${inlineCode(reasonCode)}`,
+      "",
+      `### ${strings.balancesHeading}`,
+      "",
+      `- **Native XLM balance:** ${result.xlmBalance === "unknown" ? "_unknown_" : `\`${result.xlmBalance} XLM\``}`,
+      result.reserveRequirement
+        ? `- **Minimum required (XLM reserve):** \`${result.reserveRequirement.required} XLM\` (protocol minimum \`${result.reserveRequirement.protocolMinimum} XLM\` from ${result.reserveRequirement.subentryCount} subentries/sponsorship, configured floor \`${result.reserveRequirement.configuredFloor} XLM\`)`
+        : `- **Minimum required (XLM reserve):** \`${config.minXlmReserve} XLM\``,
+      // Split display: trustline vs native (Issue #246) — deterministic, 7-decimal, handles missing/0 balance
+      (() => {
+        const asset = config.assetCode;
+        const bal = result.assetBalance ?? "0";
+        const trustline = result.trustlineExists;
+        if (bal === "unknown") {
+          return `- **${asset} trustline balance:** _unknown_ (trustline ${trustline ? "exists" : "missing"})`;
+        }
+        if (!trustline) {
+          return `- **${asset} trustline balance:** \`0 ${asset}\` — no trustline configured`;
+        }
+        // Trustline exists — show 7-decimal balance (Horizon always 7dp) and optional limit
+        const limitNote = result.trustlineLimit
+          ? ` (limit \`${result.trustlineLimit} ${asset}\`)`
+          : "";
+        return `- **${asset} trustline balance:** \`${bal} ${asset}\`${limitNote}`;
+      })(),
+      // Spread keeps the happy path byte-identical: when there is no table
+      // we emit exactly the one blank line that preceded this section.
+      ...(assetTable ? ["", assetTable, ""] : [""]),
+      `### ${strings.setupCostHeading}`,
+      "",
+      `- ${strings.minimumAccountBalance} **${STELLAR_MIN_ACCOUNT_BALANCE_XLM} XLM**`,
+      `- ${strings.baseReservePerTrustline} **${STELLAR_BASE_RESERVE_XLM} XLM**`,
+      `- ${strings.typicalMinimumToFund} **~${estimateTrustlineSetupCost()} XLM**`,
+      "",
+      `### ${strings.addTrustlineHeading}`,
+      "",
+      `- [${strings.viewAccountOnLab}](${buildAccountViewerLink(displayAddress, stellarLabNetwork)})`,
+      `- [${strings.openTransactionBuilder}](${buildChangeTrustLink(stellarLabNetwork)})`,
+      `- [${strings.lobstrWallet}](${buildLobstrLink()}) — ${strings.lobstrDescription} **${config.assetCode}** from issuer \`${displayIssuer}\``,
     );
-  }
 
-  // Ledger freshness / lag alert (Issue #107) — surfaced as a distinct banner
-  // so contributors clearly understand it is about Horizon data quality, not
-  // their wallet state.
-  if (result.ledgerFreshnessResult) {
-    const fr = result.ledgerFreshnessResult;
-    const icon =
-      fr.status === 'ok' ? '✅' : fr.status === 'stale' ? '⚠️' : 'ℹ️';
-    const lagDisplay =
-      fr.lagSeconds !== null ? `${fr.lagSeconds.toFixed(1)}s` : '_unknown_';
-    const ledgerDisplay =
-      fr.latestLedger !== null ? `#${fr.latestLedger}` : '_unknown_';
-    lines.push(
-      '',
-      `> ${icon} **Ledger freshness** — ${fr.message}`,
-      `> - Measured lag: \`${lagDisplay}\` · Latest ledger: \`${ledgerDisplay}\``,
-      fr.blocksValid
-        ? '> - ❌ This is treated as a **hard failure** (`ledger_freshness_fail_on_stale: true`).'
-        : fr.status === 'stale'
-          ? '> - ⚠️ This is an **informational warning** (`ledger_freshness_fail_on_stale: false`). Results may not reflect the current network state.'
-          : '',
-    );
-  }
+    // SEP-0007 wallet deep links (Issue #44) — independent of the checklist flag.
+    // Skipped in privacy mode because the destination address would be redacted
+    // and the resulting URI would be non-functional (Issue #691).
+    if (config.sep0007DeepLinks && !config.privacyMode) {
+      const payLink = buildSep0007PayLink({
+        destination: config.stellarAddress,
+        amount: String(STELLAR_MIN_ACCOUNT_BALANCE_XLM),
+        msg: `Activate Stellar account for ${config.assetCode} trustline`,
+        network: stellarLabNetwork,
+        originDomain: config.sep0007OriginDomain || undefined,
+      });
+      lines.push(
+        "",
+        `### ${strings.sepWalletActionsHeading}`,
+        "",
+        `_${strings.sepWalletActionsDescription}_`,
+        "",
+        `- [${strings.sendXlmToActivate.replace("{amount}", String(STELLAR_MIN_ACCOUNT_BALANCE_XLM))}](${payLink})`,
+      );
+    }
 
-  const deltaSection = formatDeltaMarkdown(config.delta);
-  if (deltaSection) {
-    lines.push('', deltaSection);
-  }
-
-  lines.push(
-    '',
-    `### ${strings.validationGateHeading}`,
-    '',
-    gate.ready
-      ? `- ${strings.readyToProceed}`
-      : `- ${strings.blockedBy} ${gate.failedLabels.join(', ')}`,
-    `- ${strings.passedChecks} ${gate.passedChecks}/${gate.totalChecks}`,
-    `- ${strings.failedChecks} ${gate.failedChecks}`,
-    '',
-    `### ${strings.balancesHeading}`,
-    '',
-    `- **Native XLM balance:** ${result.xlmBalance === 'unknown' ? '_unknown_' : `\`${result.xlmBalance} XLM\``}`,
-    result.reserveRequirement
-      ? `- **Minimum required (XLM reserve):** \`${result.reserveRequirement.required} XLM\` (protocol minimum \`${result.reserveRequirement.protocolMinimum} XLM\` from ${result.reserveRequirement.subentryCount} subentries/sponsorship, configured floor \`${result.reserveRequirement.configuredFloor} XLM\`)`
-      : `- **Minimum required (XLM reserve):** \`${config.minXlmReserve} XLM\``,
-    // Split display: trustline vs native (Issue #246) — deterministic, 7-decimal, handles missing/0 balance
-    (() => {
-      const asset = config.assetCode;
-      const bal = result.assetBalance ?? '0';
-      const trustline = result.trustlineExists;
-      if (bal === 'unknown') {
-        return `- **${asset} trustline balance:** _unknown_ (trustline ${trustline ? 'exists' : 'missing'})`;
-      }
-      if (!trustline) {
-        return `- **${asset} trustline balance:** \`0 ${asset}\` — no trustline configured`;
-      }
-      // Trustline exists — show 7-decimal balance (Horizon always 7dp) and optional limit
-      const limitNote = result.trustlineLimit ? ` (limit \`${result.trustlineLimit} ${asset}\`)` : '';
-      return `- **${asset} trustline balance:** \`${bal} ${asset}\`${limitNote}`;
-    })(),
-    '',
-    `### ${strings.setupCostHeading}`,
-    '',
-    `- ${strings.minimumAccountBalance} **${STELLAR_MIN_ACCOUNT_BALANCE_XLM} XLM**`,
-    `- ${strings.baseReservePerTrustline} **${STELLAR_BASE_RESERVE_XLM} XLM**`,
-    `- ${strings.typicalMinimumToFund} **~${estimateTrustlineSetupCost()} XLM**`,
-    '',
-    `### ${strings.addTrustlineHeading}`,
-    '',
-    `- [${strings.viewAccountOnLab}](${buildAccountViewerLink(config.stellarAddress, stellarLabNetwork)})`,
-    `- [${strings.openTransactionBuilder}](${buildChangeTrustLink(stellarLabNetwork)})`,
-    `- [${strings.lobstrWallet}](${buildLobstrLink()}) — ${strings.lobstrDescription} **${config.assetCode}** from issuer \`${config.assetIssuer}\``,
-  );
-
-  // SEP-0007 wallet deep links (Issue #44)
-  if (config.sep0007DeepLinks) {
-    const payLink = buildSep0007PayLink({
-      destination: config.stellarAddress,
-      amount: String(STELLAR_MIN_ACCOUNT_BALANCE_XLM),
-      msg: `Activate Stellar account for ${config.assetCode} trustline`,
+    // SEP-0010 challenge snippet (Issue #252) — optional, does not block ready.
+    // Prefer the dashboard proof link over a raw XDR to avoid leaking nonces in
+    // public issues.
+    const sep0010Snippet = buildSep0010ChallengeSnippet({
+      challengeXdr: config.sep0010ChallengeXdr,
+      dashboardUrl: config.sep0010DashboardUrl,
       network: stellarLabNetwork,
-      originDomain: config.sep0007OriginDomain || undefined,
+      stellarAddress: displayAddress,
     });
-    lines.push(
-      '',
-      `### ${strings.sepWalletActionsHeading}`,
-      '',
-      `_${strings.sepWalletActionsDescription}_`,
-      '',
-      `- [${strings.sendXlmToActivate.replace('{amount}', String(STELLAR_MIN_ACCOUNT_BALANCE_XLM))}](${payLink})`,
-  );
-  }
-
-  // SEP-0010 challenge snippet (Issue #252) — optional, does not block ready
-  // Prefer dashboard proof link over raw XDR to avoid leaking nonces in public issues.
-  const sep0010Snippet = buildSep0010ChallengeSnippet({
-    challengeXdr: config.sep0010ChallengeXdr,
-    dashboardUrl: config.sep0010DashboardUrl,
-    network: stellarLabNetwork,
-    stellarAddress: config.stellarAddress,
-  });
-  if (sep0010Snippet) {
-    lines.push(
-      '',
-      '### Proof of wallet control (SEP-0010)',
-      '',
-      sep0010Snippet,
-      '',
-      '_This section is informational and does not affect `ready` unless your workflow explicitly gates on it. Prefer a dashboard Freighter proof link over a raw challenge XDR to avoid reusing nonces._',
-    );
-  }
-
-  // Sponsorship info explainer (Issue #141)
-  if (result.sponsorshipInfo && (result.sponsorshipInfo.numSponsoring > 0 || result.sponsorshipInfo.numSponsored > 0)) {
-    lines.push(
-      '',
-      '### Sponsorship status',
-      '',
-      result.sponsorshipInfo.numSponsored > 0
-        ? `**This account is sponsored.** Another account is covering some or all of its reserve requirements.`
-        : '**This account sponsors other accounts** and may have reduced available balance.',
-      '',
-      `- Accounts this account sponsors: **${result.sponsorshipInfo.numSponsoring}**`,
-      `- Accounts sponsoring this account: **${result.sponsorshipInfo.numSponsored}**`,
-      '',
-      '**Reserve implications:** Sponsored accounts may have different reserve requirements than their balance suggests. The sponsoring account bears the reserve cost. [Learn more about sponsorship.](https://developers.stellar.org/learn/fundamentals/stellar-data-structures/ledger-entries#sponsorships)',
-  );
-  }
-
-  if (remediation) {
-    lines.push('', `### ${strings.remediationHeading}`, '', remediation);
-  }
-
-  lines.push(
-    '',
-    `### ${strings.configurationSummaryHeading}`,
-    '',
-    `| ${strings.inputColumn} | ${strings.valueColumn} |`,
-    `| --- | --- |`,
-    `| \`fail_on_missing\` | ${config.failOnMissing === undefined ? '_default (true)_' : config.failOnMissing ? strings.failOnMissingTrue : strings.failOnMissingFalse} |`,
-    `| \`sticky_comment\` | ${config.stickyComment === undefined ? '_default (true)_' : config.stickyComment ? strings.stickyCommentTrue : strings.stickyCommentFalse} |`,
-    `| \`wait_until_funded\` | ${config.waitUntilFunded ? strings.waitUntilFundedTrue : strings.waitUntilFundedFalse} |`,
-    `| \`onboarding_checklist\` | \`${config.onboardingChecklist === false ? 'false' : 'true'}\` |`,
-  );
-
-  // Ledger freshness config row
-  if (config.checkLedgerFreshness) {
-    lines.push(
-      `| \`check_ledger_freshness\` | \`true\` |`,
-      `| \`max_ledger_lag_seconds\` | \`${config.maxLedgerLagSeconds ?? 60}s\` |`,
-      `| \`ledger_freshness_fail_on_stale\` | \`${config.ledgerFreshnessFailOnStale ? 'true (hard fail)' : 'false (warn only)'}\` |`,
-    );
-  }
-
-  if (assetBalanceCheckEnabled) {
-    lines.push(
-      `| \`min_asset_balance\` | \`${config.minAssetBalance} ${config.assetCode}\` |`,
-  );
-  }
-
-  if (config.waitUntilFunded) {
-    const timeout = config.waitUntilFundedTimeoutMs ?? 120000;
-    const interval = config.waitUntilFundedIntervalMs ?? 5000;
-    lines.push(
-      `| \`wait_until_funded_timeout_ms\` | ${strings.waitUntilFundedTimeoutMs.replace('{ms}', String(timeout))} |`,
-      `| \`wait_until_funded_interval_ms\` | ${strings.waitUntilFundedIntervalMs.replace('{ms}', String(interval))} |`,
-  );
-  }
-
-  lines.push(
-    '',
-    `### ${strings.outputsHeading}`,
-    '',
-    `_${strings.outputsDescription}_`,
-    '',
-    `| ${strings.outputColumn} | ${strings.valueRunColumn} | ${strings.descriptionColumn} |`,
-    `| --- | --- | --- |`,
-    `| \`account_funded\` | \`${String(result.accountFunded)}\` | ${strings.accountFundedOutput} |`,
-    `| \`trustline_exists\` | \`${String(result.trustlineExists)}\` | ${strings.trustlineExistsOutput.replace('{assetCode}', config.assetCode)} |`,
-    `| \`xlm_balance\` | \`${result.xlmBalance}\` | ${strings.xlmBalanceOutput} |`,
-    `| \`native_balance\` | \`${result.xlmBalance}\` | Native XLM balance (alias of \`xlm_balance\`, 7-decimal string) |`,
-    `| \`asset_balance\` | \`${result.assetBalance ?? '0'}\` | ${config.assetCode} trustline balance (7-decimal string, \`0\` if no trustline, \`unknown\` on Horizon error) |`,
-    `| \`comment_url\` | _set after posting_ | ${strings.commentUrlOutput} |`,
-  );
-
-  // Hardened metrics JSON export (Issue #33)
-  if (config.metricsSnapshot) {
-    const metricsJson = buildHardenedMetricsJson(config.metricsSnapshot);
-    lines.push(
-      '',
-      `### ${strings.metricsHeading}`,
-      '',
-      `_${strings.metricsDescription}_`,
-      '',
-      '```json',
-      metricsJson,
-      '```',
-  );
-  }
-
-  // Expert diagnostics block (Issue #102) — only appended in debug/expert mode
-  if (config.debugMode && config.diagnosticsConfig) {
-    const diagnosticsBlock = buildDiagnosticsBlock(config.diagnosticsConfig);
-    if (diagnosticsBlock) {
-      lines.push(diagnosticsBlock);
+    if (sep0010Snippet) {
+      lines.push(
+        "",
+        "### Proof of wallet control (SEP-0010)",
+        "",
+        sep0010Snippet,
+        "",
+        "_This section is informational and does not affect `ready` unless your workflow explicitly gates on it. Prefer a dashboard Freighter proof link over a raw challenge XDR to avoid reusing nonces._",
+      );
     }
-  }
 
-  lines.push(
-    '',
-    '---',
-    TRUSTBRIDGE_FOOTER,
-  );
+    // Sponsorship info explainer (Issue #141)
+    if (
+      result.sponsorshipInfo &&
+      (result.sponsorshipInfo.numSponsoring > 0 ||
+        result.sponsorshipInfo.numSponsored > 0)
+    ) {
+      const { numSponsoring, numSponsored } = result.sponsorshipInfo;
+      const netSponsorship = numSponsoring - numSponsored;
 
-  return lines.join('\n');
+      lines.push(
+        "",
+        "### Sponsorship status",
+        "",
+        numSponsored > 0
+          ? `**This account is sponsored.** Another account is covering some or all of its reserve requirements.`
+          : "**This account sponsors other accounts** and may have reduced available balance.",
+        "",
+        `- Accounts this account sponsors: **${numSponsoring}**`,
+        `- Accounts sponsoring this account: **${numSponsored}**`,
+        `- Net sponsorship effect: **${netSponsorship > 0 ? "+" : ""}${netSponsorship}** ${
+          netSponsorship > 0
+            ? "reserve entries (increases requirement)"
+            : netSponsorship < 0
+              ? "reserve entries (reduces requirement)"
+              : "entries (balanced)"
+        }`,
+        "",
+      );
+
+      if (result.reserveRequirement) {
+        const baseReserve = 2 * 0.5;
+        const subentryReserve = result.reserveRequirement.subentryCount * 0.5;
+        const sponsorshipAdjustment = netSponsorship * 0.5;
+
+        lines.push(
+          "**Reserve calculation breakdown:**",
+          "",
+          "```",
+          `Base reserves (2):           ${baseReserve.toFixed(1)} XLM`,
+          `Subentries (${result.reserveRequirement.subentryCount}):            ${subentryReserve > 0 ? "+" : " "}${subentryReserve.toFixed(1)} XLM`,
+          numSponsoring > 0 || numSponsored > 0
+            ? `Sponsorship (${numSponsoring} - ${numSponsored}):    ${sponsorshipAdjustment >= 0 ? "+" : ""}${sponsorshipAdjustment.toFixed(1)} XLM`
+            : "",
+          "---------------------------------",
+          `Protocol minimum:            ${result.reserveRequirement.protocolMinimum.toFixed(1)} XLM`,
+          result.reserveRequirement.configuredFloor > result.reserveRequirement.protocolMinimum
+            ? `Configured floor:            ${result.reserveRequirement.configuredFloor.toFixed(1)} XLM`
+            : "",
+          `Required (final):            ${result.reserveRequirement.required.toFixed(1)} XLM`,
+          "```",
+          "",
+        );
+      }
+
+      lines.push(
+        "**Reserve implications:** Sponsored accounts may have different reserve requirements than their balance suggests. The sponsoring account bears the reserve cost.",
+        "",
+        numSponsored > 0 && numSponsoring === 0
+          ? `> \u2139\ufe0f **For contributors:** Since this account is fully sponsored, you may need less XLM than the displayed requirement. However, the sponsor must maintain sufficient reserves.`
+          : numSponsoring > 0
+            ? `> \u26a0\ufe0f **Sponsoring ${numSponsoring} account${numSponsoring > 1 ? "s" : ""} adds ${(numSponsoring * 0.5).toFixed(1)} XLM to your reserve requirement.** Deep sponsorship chains (sponsor-of-sponsor patterns) can cause unexpected reserve exhaustion if intermediate sponsors become underfunded.`
+            : "",
+        "",
+        "[Learn more about sponsorship](https://developers.stellar.org/learn/fundamentals/stellar-data-structures/ledger-entries#sponsorships) | [CAP-0033 spec](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0033.md)",
+      );
+    }
+
+    if (remediation) {
+      lines.push("", `### ${strings.remediationHeading}`, "", remediation);
+    }
+
+    lines.push(
+      "",
+      `### ${strings.configurationSummaryHeading}`,
+      "",
+      `| ${strings.inputColumn} | ${strings.valueColumn} |`,
+      `| --- | --- |`,
+      `| \`fail_on_missing\` | ${config.failOnMissing === undefined ? "_default (true)_" : config.failOnMissing ? strings.failOnMissingTrue : strings.failOnMissingFalse} |`,
+      `| \`sticky_comment\` | ${config.stickyComment === undefined ? "_default (true)_" : config.stickyComment ? strings.stickyCommentTrue : strings.stickyCommentFalse} |`,
+      `| \`wait_until_funded\` | ${config.waitUntilFunded ? strings.waitUntilFundedTrue : strings.waitUntilFundedFalse} |`,
+      `| \`onboarding_checklist\` | \`${config.onboardingChecklist === false ? "false" : "true"}\` |`,
+    );
+
+    // Ledger freshness config row
+    if (config.checkLedgerFreshness) {
+      lines.push(
+        `| \`check_ledger_freshness\` | \`true\` |`,
+        `| \`max_ledger_lag_seconds\` | \`${config.maxLedgerLagSeconds ?? 60}s\` |`,
+        `| \`ledger_freshness_fail_on_stale\` | \`${config.ledgerFreshnessFailOnStale ? "true (hard fail)" : "false (warn only)"}\` |`,
+      );
+    }
+
+    if (assetBalanceCheckEnabled) {
+      lines.push(
+        `| \`min_asset_balance\` | \`${config.minAssetBalance} ${config.assetCode}\` |`,
+      );
+    }
+
+    if (config.waitUntilFunded) {
+      const timeout = config.waitUntilFundedTimeoutMs ?? 120000;
+      const interval = config.waitUntilFundedIntervalMs ?? 5000;
+      lines.push(
+        `| \`wait_until_funded_timeout_ms\` | ${strings.waitUntilFundedTimeoutMs.replace("{ms}", String(timeout))} |`,
+        `| \`wait_until_funded_interval_ms\` | ${strings.waitUntilFundedIntervalMs.replace("{ms}", String(interval))} |`,
+      );
+    }
+
+    lines.push(
+      "",
+      `### ${strings.outputsHeading}`,
+      "",
+      `_${strings.outputsDescription}_`,
+      "",
+      `| ${strings.outputColumn} | ${strings.valueRunColumn} | ${strings.descriptionColumn} |`,
+      `| --- | --- | --- |`,
+      `| \`account_funded\` | \`${String(result.accountFunded)}\` | ${strings.accountFundedOutput} |`,
+      `| \`trustline_exists\` | \`${String(result.trustlineExists)}\` | ${strings.trustlineExistsOutput.replace("{assetCode}", config.assetCode)} |`,
+      `| \`xlm_balance\` | \`${result.xlmBalance}\` | ${strings.xlmBalanceOutput} |`,
+      `| \`native_balance\` | \`${result.xlmBalance}\` | Native XLM balance (alias of \`xlm_balance\`, 7-decimal string) |`,
+      `| \`asset_balance\` | \`${result.assetBalance ?? "0"}\` | ${config.assetCode} trustline balance (7-decimal string, \`0\` if no trustline, \`unknown\` on Horizon error) |`,
+      `| \`comment_url\` | _set after posting_ | ${strings.commentUrlOutput} |`,
+    );
+
+    // Hardened metrics JSON export (Issue #33)
+    if (config.metricsSnapshot) {
+      const metricsJson = buildHardenedMetricsJson(config.metricsSnapshot);
+      lines.push(
+        "",
+        `### ${strings.metricsHeading}`,
+        "",
+        `_${strings.metricsDescription}_`,
+        "",
+        "```json",
+        metricsJson,
+        "```",
+      );
+    }
+
+    // Expert diagnostics block (Issue #102) — only appended in debug/expert mode
+    if (config.debugMode && config.diagnosticsConfig) {
+      const diagnosticsBlock = buildDiagnosticsBlock(config.diagnosticsConfig);
+      if (diagnosticsBlock) {
+        lines.push(diagnosticsBlock);
+      }
+    }
+
+    // Custom comment template partial (#312) — injected just before the footer.
+    // Path validation, size check, content security, and interpolation escaping
+    // are all handled in loadCommentTemplate / validateTemplateContent.
+    if (config.customCommentTemplatePath) {
+      try {
+        const templateCtx = buildTemplateContext({
+          stellarAddress: displayAddress,
+          assetCode: config.assetCode,
+          assetIssuer: displayIssuer,
+          horizonUrl: config.horizonUrl,
+          network: inferStellarNetwork(config.horizonUrl),
+          valid: result.valid,
+          locale: config.locale ?? 'en',
+        });
+        const partial = loadCommentTemplate(config.customCommentTemplatePath, templateCtx);
+        if (partial !== undefined) {
+          lines.push('', partial);
+        } else {
+          // File not found — warn without blocking the comment.
+          core.warning(
+            `custom_comment_template_path "${config.customCommentTemplatePath}" was not found in the workspace. ` +
+              'The template partial will be omitted from this comment.',
+          );
+        }
+      } catch (templateErr) {
+        const message = templateErr instanceof Error ? templateErr.message : String(templateErr);
+        core.warning(
+          `Failed to load custom comment template ("${config.customCommentTemplatePath}"): ${message}. ` +
+            'The template partial will be omitted from this comment.',
+        );
+      }
+    }
+
+    lines.push("", "---", TRUSTBRIDGE_FOOTER);
+
+    return lines.join("\n");
   };
 
   let fullBody = buildWithRemediation(result.remediation);
 
   if (fullBody.length > MAX_COMMENT_LENGTH && result.remediation) {
     const excess = fullBody.length - MAX_COMMENT_LENGTH;
-    const availableForRemediation = result.remediation.length - excess - TRUNCATION_NOTICE.length;
+    const availableForRemediation =
+      result.remediation.length - excess - TRUNCATION_NOTICE.length;
 
     let truncatedRemediation: string;
     if (availableForRemediation > 0) {
-      truncatedRemediation = result.remediation.slice(0, availableForRemediation) + TRUNCATION_NOTICE;
+      truncatedRemediation =
+        result.remediation.slice(0, availableForRemediation) +
+        TRUNCATION_NOTICE;
     } else {
       truncatedRemediation = TRUNCATION_NOTICE.trimStart();
     }
-    
+
     fullBody = buildWithRemediation(truncatedRemediation);
   }
-  
+
   return fullBody;
 }
 
@@ -456,10 +683,12 @@ export function buildHardenedMetricsJson(metrics: MetricsCollector): string {
     json = JSON.stringify(safeSummary, null, 2);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return JSON.stringify({ error: `metrics serialisation failed: ${message}` });
+    return JSON.stringify({
+      error: `metrics serialisation failed: ${message}`,
+    });
   }
 
-  if (Buffer.byteLength(json, 'utf8') > MAX_METRICS_JSON_BYTES) {
+  if (Buffer.byteLength(json, "utf8") > MAX_METRICS_JSON_BYTES) {
     const truncated = {
       totalMetrics: safeSummary.totalMetrics,
       counters: safeSummary.counters,
@@ -487,7 +716,7 @@ export const COMMENT_SIZE_LIMIT_BYTES = 65536;
 export const COMMENT_TRUNCATION_NOTICE_BYTES = 512;
 
 /**
- * Build a truncated comment body that fits within `COMMENT_SIZE_LIMIT_BYTES`.
+ * Build a truncated comment body that fits within the given size limit.
  *
  * The full body is cut at a safe byte offset, a truncation notice is
  * appended, and the TrustBridge footer is preserved so the sticky-comment
@@ -496,33 +725,39 @@ export const COMMENT_TRUNCATION_NOTICE_BYTES = 512;
  *
  * @param fullBody  The full comment body produced by `formatCommentBody`.
  * @param reportPath  Workspace-relative path where the full report was written.
- * @returns A comment body that fits within the GitHub size limit.
+ * @param sizeLimit  Maximum comment body size in bytes (defaults to `COMMENT_SIZE_LIMIT_BYTES`).
+ *                   Pass a smaller value for GHES instances with custom limits.
+ * @returns A comment body that fits within the given size limit.
  *
  * @internal Exported for testing.
  */
-export function buildTruncatedCommentBody(fullBody: string, reportPath: string): string {
-  const budget = COMMENT_SIZE_LIMIT_BYTES - COMMENT_TRUNCATION_NOTICE_BYTES;
+export function buildTruncatedCommentBody(
+  fullBody: string,
+  reportPath: string,
+  sizeLimit: number = COMMENT_SIZE_LIMIT_BYTES,
+): string {
+  const budget = sizeLimit - COMMENT_TRUNCATION_NOTICE_BYTES;
 
   // Walk backwards from the budget boundary to find a clean line break.
-  const bodyBytes = Buffer.from(fullBody, 'utf8');
+  const bodyBytes = Buffer.from(fullBody, "utf8");
   let cutByte = budget;
   while (cutByte > 0 && bodyBytes[cutByte] !== 0x0a /* '\n' */) {
     cutByte--;
   }
 
-  const truncated = bodyBytes.subarray(0, cutByte).toString('utf8');
+  const truncated = bodyBytes.subarray(0, cutByte).toString("utf8");
 
   const notice = [
-    '',
-    '---',
-    '> **⚠️ Report truncated** — this comment exceeded GitHub\'s size limit.',
+    "",
+    "---",
+    "> **⚠️ Report truncated** — this comment exceeded GitHub's size limit.",
     `> The full validation report has been written to \`${reportPath}\` in the workflow workspace.`,
-    '> Upload it as a workflow artifact using `actions/upload-artifact` to make it available for download.',
-    '> See [USAGE.md](https://github.com/Stellar-TrustBridge/trustbridge-action/blob/main/docs/USAGE.md#handling-oversized-reports) for the recommended workflow pattern.',
-    '',
-    '---',
+    "> Upload it as a workflow artifact using `actions/upload-artifact` to make it available for download.",
+    "> See [USAGE.md](https://github.com/Stellar-TrustBridge/trustbridge-action/blob/main/docs/USAGE.md#handling-oversized-reports) for the recommended workflow pattern.",
+    "",
+    "---",
     TRUSTBRIDGE_FOOTER,
-  ].join('\n');
+  ].join("\n");
 
   return truncated + notice;
 }
@@ -541,15 +776,21 @@ export function buildTruncatedCommentBody(fullBody: string, reportPath: string):
  *
  * @internal Exported for testing.
  */
-export function writeFullReport(fullBody: string, outputPath: string): string | undefined {
+export function writeFullReport(
+  fullBody: string,
+  outputPath: string,
+): string | undefined {
   try {
     const resolved = path.isAbsolute(outputPath)
       ? outputPath
-      : path.resolve(process.env['GITHUB_WORKSPACE'] ?? process.cwd(), outputPath);
+      : path.resolve(
+          process.env["GITHUB_WORKSPACE"] ?? process.cwd(),
+          outputPath,
+        );
 
     const dir = path.dirname(resolved);
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(resolved, fullBody, 'utf8');
+    fs.writeFileSync(resolved, fullBody, "utf8");
 
     core.info(`Full validation report written to ${resolved}`);
     return resolved;
@@ -560,14 +801,77 @@ export function writeFullReport(fullBody: string, outputPath: string): string | 
   }
 }
 
+// ---------------------------------------------------------------------------
+// #322 — Comment threading / reply mode
+// ---------------------------------------------------------------------------
+
+/**
+ * Explicit comment threading strategy.
+ *
+ * - `'sticky'` — update the existing TrustBridge comment in place (default).
+ * - `'new'`    — always post a fresh top-level comment (full audit trail).
+ * - `'reply'`  — post a reply to the *first* TrustBridge comment in the
+ *                thread, building a chronological chain without overwriting
+ *                the original summary comment.
+ */
+export type CommentMode = 'sticky' | 'new' | 'reply';
+
+/**
+ * Valid `CommentMode` values — used for input validation.
+ */
+export const VALID_COMMENT_MODES: CommentMode[] = ['sticky', 'new', 'reply'];
+
+/**
+ * Resolve the effective `CommentMode` from action inputs.
+ *
+ * Priority: `commentMode` input > derive from `sticky` boolean > default `'sticky'`.
+ * Invalid values fall back to `'sticky'` with a warning so the action
+ * never hard-fails due to a misconfigured `comment_mode`.
+ */
+export function resolveCommentMode(
+  commentMode: string | undefined,
+  sticky: boolean | undefined,
+): CommentMode {
+  if (commentMode) {
+    const normalised = commentMode.trim().toLowerCase() as CommentMode;
+    if (VALID_COMMENT_MODES.includes(normalised)) {
+      return normalised;
+    }
+    // Invalid value — warn and fall through to default.
+    core.warning(
+      `Invalid comment_mode value "${commentMode}". Expected one of: ${VALID_COMMENT_MODES.join(', ')}. Falling back to "sticky".`,
+    );
+  }
+  // Derive from legacy sticky boolean.
+  if (sticky === false) return 'new';
+  return 'sticky';
+}
+
 export interface UpsertCommentOptions {
   /**
    * When true (default), find and update TrustBridge's previous comment on
    * the issue instead of posting a new one every run. Falls back to
    * creating a new comment when no prior comment is found, or when the
    * lookup itself fails (e.g. transient GitHub API error).
+   *
+   * @deprecated Prefer `commentMode` for explicit control.
    */
   sticky?: boolean;
+  /**
+   * Comment threading strategy (#322).
+   *
+   * - `'sticky'` (default): update the previous TrustBridge comment in place.
+   *   Equivalent to `sticky: true`.
+   * - `'new'`: always post a fresh comment for a full audit trail.
+   *   Equivalent to `sticky: false`.
+   * - `'reply'`: post a reply to the first TrustBridge comment in the thread
+   *   (using `in_reply_to` if the API supports it, else a top-level comment
+   *   that references the parent). Useful when orgs want a chronological
+   *   thread without overwriting the original.
+   *
+   * When set, `commentMode` takes precedence over `sticky`.
+   */
+  commentMode?: CommentMode;
   /**
    * When true, post the comment normally even if snoozed.
    * Useful for maintainers forcing an immediate re-alert.
@@ -584,6 +888,24 @@ export interface UpsertCommentOptions {
    * When omitted, falls back to `resolveIssueOrPullRequestNumber(github.context.payload)`.
    */
   issueNumber?: number;
+  /**
+   * Optional body factory called with the existing comment body (Issue #311).
+   *
+   * When provided alongside `sticky: true`, `postIssueComment` fetches the
+   * existing comment body (if a sticky comment is found) and passes it to
+   * this factory *before* building the final comment body.  The returned
+   * string is posted as the new comment body.
+   *
+   * Use this instead of the top-level `body` argument when the comment
+   * content depends on the previous comment body — for example, to preserve
+   * manually-checked onboarding checklist boxes (Issue #311) without making
+   * two separate round-trips to locate the comment.
+   *
+   * When the factory is provided, the `body` argument to `postIssueComment`
+   * is used only as a fallback (when there is no existing comment, or when
+   * the factory is not called due to `sticky: false`).
+   */
+  bodyFactory?: (existingBody: string | undefined) => string;
 }
 
 type Octokit = ReturnType<typeof github.getOctokit>;
@@ -608,18 +930,20 @@ type Octokit = ReturnType<typeof github.getOctokit>;
  *
  * @internal Exported for testing.
  */
-export function resolveIssueOrPullRequestNumber(payload: unknown): number | undefined {
-  if (payload && typeof payload === 'object') {
+export function resolveIssueOrPullRequestNumber(
+  payload: unknown,
+): number | undefined {
+  if (payload && typeof payload === "object") {
     const typedPayload = payload as {
       issue?: { number?: unknown };
       pull_request?: { number?: unknown };
     };
     const issueNumber = typedPayload.issue?.number;
-    if (typeof issueNumber === 'number') {
+    if (typeof issueNumber === "number") {
       return issueNumber;
     }
     const prNumber = typedPayload.pull_request?.number;
-    if (typeof prNumber === 'number') {
+    if (typeof prNumber === "number") {
       return prNumber;
     }
   }
@@ -639,6 +963,37 @@ export function isTrustBridgeComment(body: string | undefined | null): boolean {
     body.includes(STICKY_COMMENT_MARKER) ||
     body.includes(STICKY_COMMENT_MARKER_LEGACY) ||
     body.includes(TRUSTBRIDGE_FOOTER)
+  );
+}
+
+/**
+ * Detect a revalidation slash command on an issue comment.
+ *
+ * Only exact `/trustbridge` prefixes are treated as commands so that unrelated
+ * comments and other slash commands are ignored. The match is intentionally
+ * narrow and only triggers when the command begins the comment body (allowing
+ * leading whitespace, then the exact token followed by whitespace or end-of-text).
+ */
+export function isTrustBridgeSlashCommand(
+  body: string | undefined | null,
+): boolean {
+  const text = (body ?? "").trimStart();
+  return /^\/trustbridge(?:\s|$)/.test(text);
+}
+
+/**
+ * Returns true when the issue comment came from a bot account and therefore
+ * should never trigger a revalidation loop or a follow-up command.
+ */
+export function isBotCommentAuthor(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object") return false;
+  const typed = payload as {
+    comment?: { user?: { type?: string; login?: string } };
+  };
+  const user = typed.comment?.user;
+  if (!user) return false;
+  return (
+    user.type === "Bot" || Boolean(user.login && /\[bot\]$/i.test(user.login))
   );
 }
 
@@ -693,7 +1048,7 @@ export async function findStickyComment(
   const maxPages = options.maxPages ?? MAX_STICKY_COMMENT_SEARCH_PAGES;
 
   // Primary: GraphQL pagination (efficiently retrieves only databaseId + body)
-  if (typeof octokit.graphql === 'function') {
+  if (typeof octokit.graphql === "function") {
     try {
       const query = `
         query FindTrustBridgeIssueComment($owner: String!, $repo: String!, $issueNumber: Int!, $cursor: String) {
@@ -757,20 +1112,128 @@ export async function findStickyComment(
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      core.debug(`GraphQL sticky comment search failed, falling back to REST: ${message}`);
+      core.debug(
+        `GraphQL sticky comment search failed, falling back to REST: ${message}`,
+      );
     }
   }
 
   // Fallback: REST pagination with page cap
-  if (typeof octokit.paginate === 'function' && octokit.rest?.issues?.listComments) {
+  if (
+    typeof octokit.paginate === "function" &&
+    octokit.rest?.issues?.listComments
+  ) {
     const comments = await octokit.paginate(octokit.rest.issues.listComments, {
       owner,
       repo,
       issue_number: issueNumber,
       per_page: 100,
     });
-    const matches = comments.filter((comment) => isTrustBridgeComment(comment.body));
+    const matches = comments.filter((comment) =>
+      isTrustBridgeComment(comment.body),
+    );
     return matches.length > 0 ? matches[matches.length - 1]!.id : undefined;
+  }
+
+  return undefined;
+}
+
+/**
+ * Find TrustBridge's first (oldest) comment on the issue, if any.
+ *
+ * Scans comments in chronological order to find the initial TrustBridge comment
+ * to thread replies under when `comment_mode: 'reply'` is used (#419).
+ */
+export async function findFirstTrustBridgeComment(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  options: FindStickyCommentOptions = {},
+): Promise<number | undefined> {
+  const maxPages = options.maxPages ?? MAX_STICKY_COMMENT_SEARCH_PAGES;
+
+  // Primary: GraphQL pagination
+  if (typeof octokit.graphql === "function") {
+    try {
+      const query = `
+        query FindFirstTrustBridgeIssueComment($owner: String!, $repo: String!, $issueNumber: Int!, $cursor: String) {
+          repository(owner: $owner, name: $repo) {
+            issue(number: $issueNumber) {
+              comments(first: 100, after: $cursor) {
+                nodes {
+                  id
+                  databaseId
+                  body
+                }
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+              }
+            }
+          }
+        }
+      `;
+
+      let cursor: string | null = null;
+      let pageCount = 0;
+      let graphqlHandled = false;
+
+      while (pageCount < maxPages) {
+        pageCount++;
+        const data = (await octokit.graphql(query, {
+          owner,
+          repo,
+          issueNumber,
+          cursor,
+        })) as IssueCommentsGraphqlPage;
+
+        const comments = data?.repository?.issue?.comments;
+        if (!comments || !Array.isArray(comments.nodes)) {
+          break;
+        }
+
+        graphqlHandled = true;
+
+        for (const comment of comments.nodes) {
+          if (isTrustBridgeComment(comment.body)) {
+            return comment.databaseId;
+          }
+        }
+
+        if (!comments.pageInfo.hasNextPage || !comments.pageInfo.endCursor) {
+          break;
+        }
+        cursor = comments.pageInfo.endCursor;
+      }
+
+      if (graphqlHandled) {
+        return undefined;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      core.debug(
+        `GraphQL first comment search failed, falling back to REST: ${message}`,
+      );
+    }
+  }
+
+  // Fallback: REST pagination
+  if (
+    typeof octokit.paginate === "function" &&
+    octokit.rest?.issues?.listComments
+  ) {
+    const comments = await octokit.paginate(octokit.rest.issues.listComments, {
+      owner,
+      repo,
+      issue_number: issueNumber,
+      per_page: 100,
+    });
+    const match = comments.find((comment) =>
+      isTrustBridgeComment(comment.body),
+    );
+    return match?.id;
   }
 
   return undefined;
@@ -781,7 +1244,14 @@ export async function postIssueComment(
   body: string,
   options: UpsertCommentOptions = {},
 ): Promise<string | undefined> {
-  const sticky = options.sticky ?? true;
+  // Resolve effective comment mode (#322): commentMode input takes precedence
+  // over legacy sticky boolean.
+  const effectiveMode = resolveCommentMode(
+    options.commentMode,
+    options.sticky,
+  );
+  // Map back to sticky boolean for the existing snooze/lookup machinery.
+  const sticky = effectiveMode === 'sticky';
   const forceComment = options.forceComment ?? false;
   const snoozeWindowMs = options.snoozeWindowMs ?? 0;
   const context = github.context;
@@ -790,119 +1260,157 @@ export async function postIssueComment(
   // target a specific issue. Otherwise resolve from either an `issues` event
   // (`payload.issue.number`) or a `pull_request`/`pull_request_target` event
   // (`payload.pull_request.number`) — see resolveIssueOrPullRequestNumber (Issue #220).
-  const issueNumber = options.issueNumber ?? resolveIssueOrPullRequestNumber(context.payload);
+  const issueNumber =
+    options.issueNumber ?? resolveIssueOrPullRequestNumber(context.payload);
 
   if (!issueNumber) {
     core.warning(
       'No issue or pull request context found — skipping comment. Pass `issue_number` as a workflow_dispatch input or run this action on an `issues`, `pull_request`, or `pull_request_target` event.',
-  );
+    );
     return undefined;
   }
 
-  // `github.getOctokit` defaults to `https://api.github.com` unless a
-  // `baseUrl` is supplied — on GitHub Enterprise Server the runner sets
-  // `GITHUB_API_URL` to the enterprise API base (e.g.
-  // `https://ghes.example.com/api/v3`), which `context.apiUrl` reads.
-  // Passing it explicitly here is what makes comment posting work on GHES
-  // instead of silently calling the wrong (public) API host.
-  const octokit = github.getOctokit(token, { baseUrl: context.apiUrl });
-  const { owner, repo } = context.repo;
+  return traceCommentPost(issueNumber, 'create', async () => {
+    // `github.getOctokit` defaults to `https://api.github.com` unless a
+    // `baseUrl` is supplied — on GitHub Enterprise Server the runner sets
+    // `GITHUB_API_URL` to the enterprise API base (e.g.
+    // `https://ghes.example.com/api/v3`), which `context.apiUrl` reads.
+    // Passing it explicitly here is what makes comment posting work on GHES
+    // instead of silently calling the wrong (public) API host.
+    const octokit = github.getOctokit(token, { baseUrl: context.apiUrl });
+    const { owner, repo } = context.repo;
 
-  let existingCommentId: number | undefined;
-  let existingCommentBody: string | undefined;
-  let existingCommentReactions: CommentReaction[] = [];
-  
-  if (sticky) {
-    try {
-      existingCommentId = await findStickyComment(octokit, owner, repo, issueNumber);
-      
-      // Fetch comment body and reactions to check snooze status (Issue #155, Issue #227)
-      if (existingCommentId && snoozeWindowMs > 0 && !forceComment) {
-        try {
-          const commentResponse = await octokit.rest.issues.getComment({
-            owner,
-            repo,
-            comment_id: existingCommentId,
-          });
-          existingCommentBody = commentResponse.data.body;
-        } catch (error) {
-          core.debug(`Could not fetch existing comment body for snooze check: ${error}`);
-        }
+    let existingCommentId: number | undefined;
+    let existingCommentBody: string | undefined;
+    let existingCommentReactions: CommentReaction[] = [];
 
-        try {
-          if (octokit.rest?.reactions?.listForIssueComment) {
-            const reactionsResponse = await octokit.rest.reactions.listForIssueComment({
+    if (sticky) {
+      try {
+        existingCommentId = await findStickyComment(octokit, owner, repo, issueNumber);
+
+        // Fetch comment body and reactions to check snooze status (Issue #155, Issue #227)
+        if (existingCommentId && snoozeWindowMs > 0 && !forceComment) {
+          try {
+            const commentResponse = await octokit.rest.issues.getComment({
               owner,
               repo,
               comment_id: existingCommentId,
-              per_page: 100,
             });
-            if (Array.isArray(reactionsResponse?.data)) {
-              existingCommentReactions = reactionsResponse.data as unknown as CommentReaction[];
-            }
+            existingCommentBody = commentResponse.data.body;
+          } catch (error) {
+            core.debug(`Could not fetch existing comment body for snooze check: ${error}`);
           }
-        } catch (error) {
-          core.debug(`Could not fetch comment reactions for snooze check: ${error}`);
+
+          try {
+            if (octokit.rest?.reactions?.listForIssueComment) {
+              const reactionsResponse = await octokit.rest.reactions.listForIssueComment({
+                owner,
+                repo,
+                comment_id: existingCommentId,
+                per_page: 100,
+              });
+              if (Array.isArray(reactionsResponse?.data)) {
+                existingCommentReactions = reactionsResponse.data as unknown as CommentReaction[];
+              }
+            }
+          } catch (error) {
+            core.debug(`Could not fetch comment reactions for snooze check: ${error}`);
+          }
         }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        core.warning(
+          `Could not look up existing TrustBridge comment, falling back to a new comment: ${message}`,
+        );
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      core.warning(
-        `Could not look up existing TrustBridge comment, falling back to a new comment: ${message}`,
-      );
     }
-  }
 
-  // Check snooze state (Issue #155, Issue #227)
-  if (existingCommentId && snoozeWindowMs > 0 && !forceComment) {
-    const lastMarker = parseSnoozeMarker(existingCommentBody);
-    
-    // Determine if current check is passing by looking at body content
-    // The snooze marker we just added to body indicates 'pass' or 'fail'
-    const currentPassed = body.includes('<!-- trustbridge-action:snooze:status=pass');
-    
-    const snoozeState = evaluateCombinedSnoozeState(
-      currentPassed,
-      lastMarker,
-      existingCommentReactions,
-      snoozeWindowMs,
-    );
-    
-    if (snoozeState.isSnoozed) {
-      core.info(
-        `Snooze window active (${Math.round((snoozeState.elapsedMs ?? 0) / 1000)}s elapsed). Suppressing comment update. Outputs remain updated.`,
+    // Check snooze state (Issue #155, Issue #227)
+    if (existingCommentId && snoozeWindowMs > 0 && !forceComment) {
+      const lastMarker = parseSnoozeMarker(existingCommentBody);
+
+      // Determine if current check is passing by looking at body content
+      // The snooze marker we just added to body indicates 'pass' or 'fail'
+      const currentPassed = body.includes('<!-- trustbridge-action:snooze:status=pass');
+
+      const snoozeState = evaluateCombinedSnoozeState(
+        currentPassed,
+        lastMarker,
+        existingCommentReactions,
+        snoozeWindowMs,
       );
-      return existingCommentId ? `https://github.com/${owner}/${repo}/issues/${issueNumber}#issuecomment-${existingCommentId}` : undefined;
-    }
-  }
 
-  if (existingCommentId) {
-    try {
-      const response = await octokit.rest.issues.updateComment({
+      if (snoozeState.isSnoozed) {
+        core.info(
+          `Snooze window active (${Math.round((snoozeState.elapsedMs ?? 0) / 1000)}s elapsed). Suppressing comment update. Outputs remain updated.`,
+        );
+        return existingCommentId ? `https://github.com/${owner}/${repo}/issues/${issueNumber}#issuecomment-${existingCommentId}` : undefined;
+      }
+    }
+
+    if (existingCommentId) {
+      try {
+        const response = await octokit.rest.issues.updateComment({
+          owner,
+          repo,
+          comment_id: existingCommentId,
+          body,
+        });
+        core.info(`Updated existing TrustBridge comment on issue #${issueNumber}.`);
+        return response.data.html_url;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        core.warning(
+          `Could not update existing TrustBridge comment (id=${existingCommentId}), falling back to a new comment: ${message}`,
+        );
+      }
+    }
+
+    // Reply mode (Issue #419): locate the first TrustBridge comment in the thread
+    // and post a threaded reply referencing it. GitHub's issue comments REST API
+    // does not support a native `in_reply_to` parameter (unlike review comments),
+    // so chronological threading is achieved by linking back to the root comment.
+    // If no prior TrustBridge comment exists, it falls back to creating the initial comment.
+    if (effectiveMode === 'reply') {
+      let parentCommentId: number | undefined;
+      try {
+        parentCommentId = await findFirstTrustBridgeComment(
+          octokit,
+          owner,
+          repo,
+          issueNumber,
+        );
+      } catch (error) {
+        core.debug(`reply mode: could not find parent comment: ${error}`);
+      }
+
+      const replyBody = parentCommentId
+        ? `> _Reply to [TrustBridge check #${parentCommentId}](https://github.com/${owner}/${repo}/issues/${issueNumber}#issuecomment-${parentCommentId})_\n\n${body}`
+        : body;
+
+      const response = await octokit.rest.issues.createComment({
         owner,
         repo,
-        comment_id: existingCommentId,
-        body,
+        issue_number: issueNumber,
+        body: replyBody,
       });
-      core.info(`Updated existing TrustBridge comment on issue #${issueNumber}.`);
+
+      core.info(
+        `Posted TrustBridge reply comment on issue #${issueNumber}${parentCommentId ? ` (reply to #${parentCommentId})` : ''}.`,
+      );
       return response.data.html_url;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      core.warning(
-        `Could not update existing TrustBridge comment (id=${existingCommentId}), falling back to a new comment: ${message}`,
-    );
     }
-  }
 
-  const response = await octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number: issueNumber,
-    body,
+    const response = await octokit.rest.issues.createComment({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      body,
+    });
+
+    core.info(`Posted TrustBridge comment on issue #${issueNumber}.`);
+    return response.data.html_url;
   });
-
-  core.info(`Posted TrustBridge comment on issue #${issueNumber}.`);
-  return response.data.html_url;
 }
 
 // ---------------------------------------------------------------------------
@@ -927,11 +1435,42 @@ export async function postIssueComment(
  * @internal Exported for testing.
  */
 export function resolveDiscussionNodeId(payload: unknown): string | undefined {
-  if (payload && typeof payload === 'object') {
-    const discussion = (payload as { discussion?: { node_id?: unknown } }).discussion;
+  if (payload && typeof payload === "object") {
+    const discussion = (payload as { discussion?: { node_id?: unknown } })
+      .discussion;
     const nodeId = discussion?.node_id;
-    if (typeof nodeId === 'string' && nodeId.trim()) {
+    if (typeof nodeId === "string" && nodeId.trim()) {
       return nodeId.trim();
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The discussion comment that triggered a `discussion_comment` event, as
+ * needed to thread TrustBridge's reply (Issue #472).
+ *
+ * - `nodeId`: GraphQL node id of the triggering comment.
+ * - `isReply`: true when the triggering comment is itself a reply
+ *   (`comment.parent_id` is set). GitHub Discussions allow only one level of
+ *   replies, so the reply must then target the triggering comment's parent.
+ *
+ * Returns `undefined` for events without a comment (e.g. `discussion`),
+ * where TrustBridge posts a top-level comment.
+ *
+ * @internal Exported for testing.
+ */
+export function resolveDiscussionCommentTarget(
+  payload: unknown,
+): { nodeId: string; isReply: boolean } | undefined {
+  if (payload && typeof payload === "object") {
+    const comment = (payload as { comment?: { node_id?: unknown; parent_id?: unknown } }).comment;
+    const nodeId = comment?.node_id;
+    if (typeof nodeId === "string" && nodeId.trim()) {
+      return {
+        nodeId: nodeId.trim(),
+        isReply: comment?.parent_id !== undefined && comment?.parent_id !== null,
+      };
     }
   }
   return undefined;
@@ -943,6 +1482,13 @@ export interface UpsertDiscussionCommentOptions extends UpsertCommentOptions {
    * resolved from `github.context.payload.discussion.node_id`.
    */
   discussionId?: string;
+  /**
+   * Node id of the top-level discussion comment to reply under (Issue #472).
+   * When omitted, it is resolved from a `discussion_comment` event payload:
+   * the triggering comment, or its parent when it is itself a reply. Other
+   * events post a top-level comment.
+   */
+  replyToId?: string;
 }
 
 interface DiscussionCommentNode {
@@ -979,14 +1525,18 @@ interface DiscussionCommentMutationResult {
 export async function findStickyDiscussionComment(
   octokit: Octokit,
   discussionId: string,
-  options: FindStickyCommentOptions = {},
+  options: FindStickyCommentOptions & { replyToId?: string } = {},
 ): Promise<DiscussionCommentNode | undefined> {
   const maxPages = options.maxPages ?? MAX_STICKY_COMMENT_SEARCH_PAGES;
+  // When threading (Issue #472), search the replies of the thread's top-level
+  // comment so each thread keeps its own sticky comment.
+  const selection = options.replyToId
+    ? '... on DiscussionComment {\n          comments: replies(first: 100, after: $cursor) {'
+    : '... on Discussion {\n          comments(first: 100, after: $cursor) {';
   const query = `
     query FindTrustBridgeDiscussionComment($discussionId: ID!, $cursor: String) {
       node(id: $discussionId) {
-        ... on Discussion {
-          comments(first: 100, after: $cursor) {
+        ${selection}
             nodes {
               id
               body
@@ -1016,10 +1566,10 @@ export async function findStickyDiscussionComment(
 
   while (pageCount < maxPages) {
     pageCount++;
-    const data = (await octokit.graphql(
-      query,
-      { discussionId, cursor },
-    )) as DiscussionCommentsPage;
+    const data = (await octokit.graphql(query, {
+      discussionId: options.replyToId ?? discussionId,
+      cursor,
+    })) as DiscussionCommentsPage;
 
     const comments = data?.node?.comments;
     if (!comments) {
@@ -1046,6 +1596,47 @@ export async function findStickyDiscussionComment(
 }
 
 /**
+ * Resolve the top-level comment a reply should thread under for a
+ * `discussion_comment` event (Issue #472).
+ *
+ * A top-level triggering comment is used directly. When the triggering
+ * comment is itself a reply, its parent is looked up via GraphQL (`replyTo`),
+ * because GitHub rejects replies to replies. If that lookup fails, the reply
+ * falls back to a top-level comment rather than failing the run.
+ */
+async function resolveDiscussionReplyToId(
+  octokit: Octokit,
+  payload: unknown,
+): Promise<string | undefined> {
+  const target = resolveDiscussionCommentTarget(payload);
+  if (!target) return undefined;
+  if (!target.isReply) return target.nodeId;
+
+  try {
+    const data = (await octokit.graphql(
+      `query TrustBridgeDiscussionReplyParent($commentId: ID!) {
+        node(id: $commentId) {
+          ... on DiscussionComment { replyTo { id } }
+        }
+      }`,
+      { commentId: target.nodeId },
+    )) as { node?: { replyTo?: { id?: string } | null } | null };
+    const parentId = data?.node?.replyTo?.id;
+    if (parentId) return parentId;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    core.warning(
+      `Could not resolve the parent thread of discussion comment ${target.nodeId}, posting a top-level comment instead: ${message}`,
+    );
+    return undefined;
+  }
+  core.warning(
+    `Discussion comment ${target.nodeId} has no resolvable parent thread; posting a top-level comment instead.`,
+  );
+  return undefined;
+}
+
+/**
  * Post (or sticky-upsert) a TrustBridge comment on a GitHub Discussion via
  * the GraphQL API.
  *
@@ -1054,6 +1645,10 @@ export async function findStickyDiscussionComment(
  * TrustBridge comment on the discussion is updated in place via
  * `updateDiscussionComment`; otherwise a new comment is created via
  * `addDiscussionComment`.
+ *
+ * On `discussion_comment` events the comment is threaded under the triggering
+ * comment's top-level thread (`replyToId`), and the sticky lookup is scoped to
+ * that thread's replies (Issue #472).
  *
  * Requires `discussions: write` permission on the workflow token (documented
  * in docs/USAGE.md). A missing permission surfaces as a GraphQL mutation
@@ -1068,7 +1663,7 @@ export async function postDiscussionComment(
   body: string,
   options: UpsertDiscussionCommentOptions = {},
 ): Promise<string | undefined> {
-  const sticky = options.sticky ?? true;
+  const sticky = resolveCommentMode(options.commentMode, options.sticky) === 'sticky';
   const forceComment = options.forceComment ?? false;
   const snoozeWindowMs = options.snoozeWindowMs ?? 0;
   const context = github.context;
@@ -1077,17 +1672,26 @@ export async function postDiscussionComment(
 
   if (!discussionId) {
     core.warning(
-      'No discussion context found — skipping comment. Run this action on a `discussion` event (the payload must include discussion.node_id).',
+      "No discussion context found — skipping comment. Run this action on a `discussion` event (the payload must include discussion.node_id).",
     );
     return undefined;
   }
 
-  const octokit = github.getOctokit(token, { baseUrl: context.apiUrl });
+  const proxyOpts2 = getOctokitProxyOptions(context.apiUrl);
+  const octokit = github.getOctokit(token, { baseUrl: context.apiUrl, ...proxyOpts2 });
+
+  const replyToId =
+    options.replyToId ??
+    (await resolveDiscussionReplyToId(octokit, context.payload));
 
   let existingComment: DiscussionCommentNode | undefined;
   if (sticky) {
     try {
-      existingComment = await findStickyDiscussionComment(octokit, discussionId);
+      existingComment = await findStickyDiscussionComment(
+        octokit,
+        discussionId,
+        { replyToId },
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       core.warning(
@@ -1099,7 +1703,9 @@ export async function postDiscussionComment(
   // Check snooze state (Issue #155, Issue #227) — mirrors the issue-comment path.
   if (existingComment && snoozeWindowMs > 0 && !forceComment) {
     const lastMarker = parseSnoozeMarker(existingComment.body);
-    const currentPassed = body.includes('<!-- trustbridge-action:snooze:status=pass');
+    const currentPassed = body.includes(
+      "<!-- trustbridge-action:snooze:status=pass",
+    );
     const snoozeState = evaluateCombinedSnoozeState(
       currentPassed,
       lastMarker,
@@ -1126,7 +1732,9 @@ export async function postDiscussionComment(
         { commentId: existingComment.id, body },
       )) as DiscussionCommentMutationResult;
       const url = data.updateDiscussionComment?.comment.url;
-      core.info(`Updated existing TrustBridge comment on discussion ${discussionId}.`);
+      core.info(
+        `Updated existing TrustBridge comment on discussion ${discussionId}.`,
+      );
       return url;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1137,14 +1745,18 @@ export async function postDiscussionComment(
   }
 
   const data = (await octokit.graphql(
-    `mutation AddTrustBridgeDiscussionComment($discussionId: ID!, $body: String!) {
-      addDiscussionComment(input: { discussionId: $discussionId, body: $body }) {
+    `mutation AddTrustBridgeDiscussionComment($discussionId: ID!, $body: String!, $replyToId: ID) {
+      addDiscussionComment(input: { discussionId: $discussionId, body: $body, replyToId: $replyToId }) {
         comment { id url }
       }
     }`,
-    { discussionId, body },
+    { discussionId, body, replyToId: replyToId ?? null },
   )) as DiscussionCommentMutationResult;
 
-  core.info(`Posted TrustBridge comment on discussion ${discussionId}.`);
+  core.info(
+    replyToId
+      ? `Posted TrustBridge reply in thread ${replyToId} on discussion ${discussionId}.`
+      : `Posted TrustBridge comment on discussion ${discussionId}.`,
+  );
   return data.addDiscussionComment?.comment.url;
 }

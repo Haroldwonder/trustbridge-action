@@ -37,6 +37,20 @@ export interface CacheBackendOptions {
      * When provided, overrides useActionsCacheBackend.
      */
     backend?: PersistentCacheBackend;
+    /**
+     * Named backend selector. Supported values: `"github-actions"` (persists via
+     * GitHub Actions cache API) and `"memory"` (in-memory only, default).
+     *
+     * Any other value is **not supported** and will be ignored with a warning.
+     * The cache will fall back to in-memory-only mode so the workflow does not
+     * break, but the selected backend will not be active.
+     *
+     * @example
+     * ```ts
+     * new SimpleCache({ selectedBackend: 'github-actions' })
+     * ```
+     */
+    selectedBackend?: string;
 }
 /**
  * Interface for pluggable persistent cache backends (GitHub Actions cache, Redis, etc.).
@@ -62,13 +76,17 @@ export interface PersistentCacheBackend {
 }
 /**
  * GitHub Actions cache backend implementation.
- * Uses the @actions/cache module to store data in GitHub Actions cache backend.
+ * Uses the @actions/cache module to store and retrieve check-result data in the
+ * GitHub Actions cache backend across matrix jobs and workflow runs.
  */
 export declare class GitHubActionsCacheBackend implements PersistentCacheBackend {
     private cacheKeyPrefix;
-    private static initialized;
-    private cache;
+    private cacheDir;
+    private memCache;
     constructor(cacheKeyPrefix?: string);
+    private hashKey;
+    private getFilePath;
+    private getActionsCacheKey;
     getCache(key: string): Promise<string | null>;
     saveCache(key: string, value: string, ttlMs: number): Promise<void>;
     restoreCache(key: string): Promise<boolean>;
@@ -81,28 +99,79 @@ export declare class SimpleCache {
     constructor(options?: CacheBackendOptions);
     /**
      * Get a cached value if it exists and hasn't expired.
-     * Checks in-memory cache first, then persistent backend if enabled.
+     *
+     * Checks the in-memory store first; entries are evicted lazily on access
+     * when their TTL has elapsed.  If a persistent backend is configured, it
+     * must be pre-warmed via {@link restoreAsync} because this method is
+     * synchronous and cannot await a backend call.
+     *
+     * Cache keys are opaque strings.  In practice they are built by
+     * `buildCacheKey` in `horizon.ts` using the format
+     * `horizon:account:<normalizedHorizonUrl>:<stellarAddress>`, which ensures
+     * that entries for different Horizon endpoints (mainnet vs testnet matrix
+     * legs) and different Stellar addresses never collide even when a single
+     * `SimpleCache` instance is shared across calls.
+     *
+     * @param key  The opaque cache key (built by `buildCacheKey` in `horizon.ts`).
+     * @returns    The cached value, or `null` on a miss or after expiry.
      */
     get<T>(key: string): T | null;
     /**
-     * Asynchronously restore cache from persistent backend on startup.
-     * Should be called once at action start before any get() calls.
+     * Asynchronously restore a single cache entry from the persistent backend.
+     *
+     * Must be called before any {@link get} calls when using a persistent
+     * backend, because {@link get} is synchronous.  If no backend is configured
+     * this is a no-op and returns `null`.  Restored entries are also written to
+     * the in-memory store with the default 60-second in-memory TTL so that
+     * subsequent synchronous reads remain fast.
+     *
+     * @param key  The opaque cache key to look up in the backend.
+     * @returns    The restored value, or `null` if not found, expired, or on error.
      */
     restoreAsync<T>(key: string): Promise<T | null>;
     /**
-     * Set a value in the cache with an expiration time.
-     * Persists to backend if enabled.
-     * @param key Cache key
-     * @param data Data to cache
-     * @param ttlMs Time to live in milliseconds (default: 60 seconds)
+     * Store a value in the cache with an expiration time.
+     *
+     * The entry is written to the in-memory store immediately.  If a
+     * persistent backend is configured the write is also dispatched
+     * asynchronously (fire-and-forget) — backend write failures are silently
+     * swallowed so they never block the caller or break the primary code path.
+     *
+     * **Note on key isolation.** Each `(horizonUrl, stellarAddress)` pair
+     * receives its own distinct key (see `buildCacheKey` in `horizon.ts`), so
+     * there is no risk of a mainnet entry overwriting a testnet entry even when
+     * the same `SimpleCache` instance is reused across matrix legs.
+     *
+     * **Note on 404 responses.** Account-not-found (404) results are *never*
+     * passed to `set` — the caller (`fetchAccount` in `horizon.ts`) skips
+     * caching entirely for not-found responses so a contributor who funds their
+     * account mid-job is picked up on the next request.
+     *
+     * @param key     Opaque cache key (built by `buildCacheKey` in `horizon.ts`).
+     * @param data    The value to store.  Must be JSON-serializable when a
+     *                persistent backend is configured.
+     * @param ttlMs   Time to live in milliseconds.  Defaults to 60 seconds.
      */
     set<T>(key: string, data: T, ttlMs?: number): void;
     /**
-     * Clear all cached entries (in-memory and backend).
+     * Remove all cached entries from the in-memory store and, if a persistent
+     * backend is configured, call its `dispose` lifecycle hook.
+     *
+     * This is a full reset — all keys, regardless of their remaining TTL, are
+     * discarded.  Useful in tests to guarantee a clean slate between cases.
      */
     clear(): Promise<void>;
     /**
-     * Get cache statistics for debugging.
+     * Return a snapshot of the current in-memory cache state for debugging.
+     *
+     * Keys in the returned `entries` array are **not** redacted here — callers
+     * that log or export the stats should pass them through `redactCacheStats`
+     * in `horizon.ts` before they reach any log output so that embedded
+     * Stellar addresses are masked to first-4/last-4.
+     *
+     * @returns `{ size, entries }` — count of live entries and their raw keys.
+     *          Also includes `backendEnabled: true` when a persistent backend
+     *          is active.
      */
     getStats(): {
         size: number;

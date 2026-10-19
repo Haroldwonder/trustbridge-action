@@ -43,6 +43,7 @@ import * as crypto from 'crypto';
 import * as core from '@actions/core';
 import { redactStellarAddress, redactHorizonUrl } from './logger';
 import type { ValidationResult } from './checks';
+import { traceWebhookDeliver } from './tracing';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -61,6 +62,8 @@ export interface WebhookConfig {
   webhookSecret?: string;
   /** Request timeout in milliseconds. Default 5 000. */
   timeoutMs?: number;
+  /** Parent cancellation signal, such as an Actions runner job-abort signal. */
+  signal?: AbortSignal;
   /**
    * Authentication mode: 'hmac' (default) or 'oidc'.
    */
@@ -73,6 +76,33 @@ export interface WebhookConfig {
    * Pre-minted OIDC token if already obtained, or passed for testing.
    */
   oidcToken?: string;
+}
+
+type RunnerSignalSource = Pick<NodeJS.Process, 'on' | 'removeListener'> & {
+  exitCode?: number | string | null;
+};
+
+/** Bridge Actions runner termination signals to the in-flight webhook request. */
+export function listenForRunnerCancellation(
+  controller: AbortController,
+  signalSource: RunnerSignalSource = process,
+): () => void {
+  const onSigint = (): void => {
+    signalSource.exitCode = 130;
+    controller.abort(new Error('Actions runner cancelled the job (SIGINT).'));
+  };
+  const onSigterm = (): void => {
+    signalSource.exitCode = 143;
+    controller.abort(new Error('Actions runner cancelled the job (SIGTERM).'));
+  };
+
+  signalSource.on('SIGINT', onSigint);
+  signalSource.on('SIGTERM', onSigterm);
+
+  return () => {
+    signalSource.removeListener('SIGINT', onSigint);
+    signalSource.removeListener('SIGTERM', onSigterm);
+  };
 }
 
 export interface WebhookPayload {
@@ -117,6 +147,20 @@ export function computeWebhookSignature(body: string, secret: string): string {
   return `sha256=${hmac.digest('hex')}`;
 }
 
+/**
+ * Verify a webhook signature using a constant-time comparison.
+ *
+ * Receivers should pass the raw request body so verification covers the exact
+ * bytes that were signed rather than a re-serialised JSON representation.
+ */
+export function verifyWebhookSignature(body: string, signature: string, secret: string): boolean {
+  const expected = computeWebhookSignature(body, secret);
+  const received = Buffer.from(signature, 'utf8');
+  const expectedBytes = Buffer.from(expected, 'utf8');
+
+  return received.length === expectedBytes.length && crypto.timingSafeEqual(received, expectedBytes);
+}
+
 // ---------------------------------------------------------------------------
 // Payload builder
 // ---------------------------------------------------------------------------
@@ -152,12 +196,119 @@ export function buildWebhookPayload(
 }
 
 // ---------------------------------------------------------------------------
+// Schema validation (Issue #471)
+// ---------------------------------------------------------------------------
+
+/** Mirrors `schemas/webhook-payload.schema.json`; kept in sync by webhook-contract tests. */
+export const WEBHOOK_PAYLOAD_REQUIRED_FIELDS = [
+  'schema_version',
+  'event',
+  'timestamp',
+  'repository',
+  'issue_number',
+  'stellar_address',
+  'result',
+] as const;
+export const WEBHOOK_RESULT_REQUIRED_FIELDS = [
+  'valid',
+  'account_funded',
+  'trustline_exists',
+  'xlm_balance',
+  'checks',
+] as const;
+export const WEBHOOK_CHECK_REQUIRED_FIELDS = ['label', 'passed'] as const;
+export const WEBHOOK_REPOSITORY_PATTERN = '^[^/]+/[^/]+$';
+export const WEBHOOK_STELLAR_ADDRESS_PATTERN = '^[GC][A-Z2-7]{3}\\.{3}[A-Z2-7]{4}$';
+
+const ISO_DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+function checkObjectKeys(
+  obj: Record<string, unknown>,
+  allowed: readonly string[],
+  at: string,
+  errors: string[],
+): void {
+  for (const field of allowed) {
+    if (!(field in obj)) errors.push(`${at}: missing required property "${field}"`);
+  }
+  for (const key of Object.keys(obj)) {
+    if (!allowed.includes(key)) errors.push(`${at}: unexpected property "${key}"`);
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Validate an outbound webhook payload against
+ * `schemas/webhook-payload.schema.json`.
+ *
+ * @returns A list of violations; empty when the payload is conformant.
+ */
+export function validateWebhookPayload(payload: unknown): string[] {
+  const errors: string[] = [];
+  if (!isPlainObject(payload)) return ['payload: must be an object'];
+
+  checkObjectKeys(payload, WEBHOOK_PAYLOAD_REQUIRED_FIELDS, 'payload', errors);
+
+  if (payload.schema_version !== '1') errors.push('schema_version: must be "1"');
+  if (payload.event !== 'validation_complete') errors.push('event: must be "validation_complete"');
+  if (typeof payload.timestamp !== 'string' || !ISO_DATE_TIME.test(payload.timestamp) || isNaN(Date.parse(payload.timestamp))) {
+    errors.push('timestamp: must be an ISO-8601 date-time string');
+  }
+  if (typeof payload.repository !== 'string' || !new RegExp(WEBHOOK_REPOSITORY_PATTERN).test(payload.repository)) {
+    errors.push('repository: must be in "owner/repo" format');
+  }
+  const issue = payload.issue_number;
+  if (issue !== null && (typeof issue !== 'number' || !Number.isInteger(issue) || issue < 1)) {
+    errors.push('issue_number: must be an integer >= 1 or null');
+  }
+  if (typeof payload.stellar_address !== 'string' || !new RegExp(WEBHOOK_STELLAR_ADDRESS_PATTERN).test(payload.stellar_address)) {
+    errors.push('stellar_address: must be a redacted address (first-4...last-4)');
+  }
+
+  const result = payload.result;
+  if (!isPlainObject(result)) {
+    if ('result' in payload) errors.push('result: must be an object');
+    return errors;
+  }
+  checkObjectKeys(result, WEBHOOK_RESULT_REQUIRED_FIELDS, 'result', errors);
+  for (const field of ['valid', 'account_funded', 'trustline_exists'] as const) {
+    if (field in result && typeof result[field] !== 'boolean') errors.push(`result.${field}: must be a boolean`);
+  }
+  if ('xlm_balance' in result && typeof result.xlm_balance !== 'string') {
+    errors.push('result.xlm_balance: must be a string');
+  }
+  if ('checks' in result) {
+    if (!Array.isArray(result.checks)) {
+      errors.push('result.checks: must be an array');
+    } else {
+      result.checks.forEach((check, i) => {
+        const at = `result.checks[${i}]`;
+        if (!isPlainObject(check)) {
+          errors.push(`${at}: must be an object`);
+          return;
+        }
+        checkObjectKeys(check, WEBHOOK_CHECK_REQUIRED_FIELDS, at, errors);
+        if ('label' in check && typeof check.label !== 'string') errors.push(`${at}.label: must be a string`);
+        if ('passed' in check && typeof check.passed !== 'boolean') errors.push(`${at}.passed: must be a boolean`);
+      });
+    }
+  }
+
+  return errors;
+}
+
+// ---------------------------------------------------------------------------
 // Delivery
 // ---------------------------------------------------------------------------
 
 /**
  * Deliver a signed webhook notification to the configured endpoint.
  *
+ * - Validates the payload against `schemas/webhook-payload.schema.json` and
+ *   refuses to send (fail closed) when it does not conform.
  * - Signs the JSON payload with HMAC-SHA256 when a secret is provided.
  * - Respects `timeoutMs` via `AbortController`.
  * - **Never throws** — all errors are swallowed and returned in the result
@@ -172,6 +323,16 @@ export async function deliverWebhook(
   fetchFn: typeof fetch = fetch,
 ): Promise<WebhookDeliveryResult> {
   const timeoutMs = config.timeoutMs ?? 5_000;
+
+  // Fail closed: never send a body that breaks the published receiver contract.
+  const violations = validateWebhookPayload(payload);
+  if (violations.length > 0) {
+    return {
+      sent: false,
+      error: `payload failed webhook-payload.schema.json validation: ${violations.join('; ')}`,
+    };
+  }
+
   let body: string;
   try {
     body = JSON.stringify(payload);
@@ -183,6 +344,9 @@ export async function deliverWebhook(
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'User-Agent': 'trustbridge-action/1',
+    // Schema version header allows receivers to route/validate without parsing the body first.
+    // Updated whenever schema_version in the payload changes (Issue #296).
+    'X-TrustBridge-Schema-Version': payload.schema_version,
   };
 
   if (config.authMode === 'oidc' || config.oidcToken) {
@@ -194,6 +358,12 @@ export async function deliverWebhook(
   }
 
   const controller = new AbortController();
+  const abortFromParent = (): void => controller.abort(config.signal?.reason);
+  if (config.signal?.aborted) {
+    abortFromParent();
+  } else {
+    config.signal?.addEventListener('abort', abortFromParent, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
@@ -210,6 +380,7 @@ export async function deliverWebhook(
     return { sent: false, error: msg };
   } finally {
     clearTimeout(timer);
+    config.signal?.removeEventListener('abort', abortFromParent);
   }
 }
 
@@ -234,36 +405,38 @@ export async function sendWebhookNotification(
 ): Promise<void> {
   if (!config.webhookUrl) return;
 
-  // Redact the URL for log output so any embedded credentials are masked.
-  const safeUrl = redactHorizonUrl(config.webhookUrl);
+  return traceWebhookDeliver(config.webhookUrl, config.authMode || 'hmac', async () => {
+    // Redact the URL for log output so any embedded credentials are masked.
+    const safeUrl = redactHorizonUrl(config.webhookUrl);
 
-  let effectiveConfig = { ...config };
-  if (config.authMode === 'oidc' && !config.oidcToken) {
-    const audience = config.oidcAudience || 'trustbridge-dashboard';
-    try {
-      const token = await core.getIDToken(audience);
-      if (token) {
-        core.setSecret(token);
-        effectiveConfig.oidcToken = token;
+    const effectiveConfig: WebhookConfig = { ...config };
+    if (config.authMode === 'oidc' && !config.oidcToken) {
+      const audience = config.oidcAudience || 'trustbridge-dashboard';
+      try {
+        const token = await core.getIDToken(audience);
+        if (token) {
+          core.setSecret(token);
+          effectiveConfig.oidcToken = token;
+        }
+      } catch (oidcError) {
+        const msg = oidcError instanceof Error ? oidcError.message : String(oidcError);
+        core.warning(
+          `[TrustBridge] OIDC token minting failed for audience "${audience}": ${msg}. Ensure the workflow has 'permissions: id-token: write'.`,
+        );
       }
-    } catch (oidcError) {
-      const msg = oidcError instanceof Error ? oidcError.message : String(oidcError);
+    }
+
+    const payload = buildWebhookPayload(result, stellarAddress, repository, issueNumber);
+    const delivery = await deliverWebhook(payload, effectiveConfig);
+
+    if (delivery.sent) {
+      core.info(
+        `[TrustBridge] Webhook delivered to ${safeUrl} (${config.authMode === 'oidc' ? 'OIDC' : 'HMAC'}) — HTTP ${delivery.statusCode ?? 'unknown'}.`,
+      );
+    } else {
       core.warning(
-        `[TrustBridge] OIDC token minting failed for audience "${audience}": ${msg}. Ensure the workflow has 'permissions: id-token: write'.`,
+        `[TrustBridge] Webhook delivery to ${safeUrl} failed (non-fatal): ${delivery.error ?? 'unknown error'}. Comment posting continues.`,
       );
     }
-  }
-
-  const payload = buildWebhookPayload(result, stellarAddress, repository, issueNumber);
-  const delivery = await deliverWebhook(payload, effectiveConfig);
-
-  if (delivery.sent) {
-    core.info(
-      `[TrustBridge] Webhook delivered to ${safeUrl} (${config.authMode === 'oidc' ? 'OIDC' : 'HMAC'}) — HTTP ${delivery.statusCode ?? 'unknown'}.`,
-    );
-  } else {
-    core.warning(
-      `[TrustBridge] Webhook delivery to ${safeUrl} failed (non-fatal): ${delivery.error ?? 'unknown error'}. Comment posting continues.`,
-    );
-  }
+  });
 }

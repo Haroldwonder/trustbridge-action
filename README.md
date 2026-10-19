@@ -103,6 +103,7 @@ Collecting wallets via a GitHub Issue Form instead of a hardcoded address? See [
 | `horizon_cache_ttl_ms` | No | `60000` | In-memory Horizon account cache TTL in milliseconds, used when `use_cache: true`. Cached results skip the network call entirely within the TTL window. Set to `0` to disable caching. Maximum 3,600,000 ms (1 hour). |
 | `use_cache` | No | `false` | Cache successful Horizon account responses in job memory to minimize redundant calls. Disabled by default; account-not-found (404) responses are never cached. |
 | `allow_cross_network_fallback` | No | `false` | Allow `horizon_url_fallback` / `rpc_fallback_url` to be used even when it resolves to a different Stellar network (public vs testnet) than `horizon_url`. Off by default so a misconfigured fallback can't silently return data for the wrong ledger. |
+| `horizon_pin_fingerprint` | No | _(empty)_ | Optional TLS certificate fingerprint (SHA-256, colon-separated hex) to pin the Horizon endpoint certificate. When set, TrustBridge performs a pre-flight TLS probe and fails with `TLS_ERROR` on mismatch. Empty (default) disables pinning. |
 | `log_inputs` | No | `false` | Emit a structured JSON log record of all resolved action inputs at run start. Stellar addresses and Horizon URLs are redacted (first-4…last-4) before the record is written to GitHub Actions log output. Useful for auditing which inputs were active during a run. |
 | `trustbridge_config_path` | No | `.trustbridge.yml` | Path (relative to repository root, or absolute) to a consumer `trustbridge.yml` config file that can supply defaults for `horizon_url`, `asset_code`, `asset_issuer`, `min_xlm_reserve`, and other inputs. Explicit action inputs always override file values. The file is validated for SSRF-safe URLs, injection-clean strings, and secret field redaction before any value is used. Leave empty to skip the file entirely. |
 | `network_passphrase` | No | `Public Global Stellar Network ; September 2015` | The expected Stellar network passphrase. Used to verify that the configured Horizon URL matches the intended network identity, ensuring that misconfigured combinations (like using the Public USDC issuer on the Testnet) fail fast. |
@@ -642,7 +643,7 @@ CI runs `build-and-test` in parallel on both versions (see [`.github/workflows/c
 ### Comment Golden Snapshots & Coverage Gates
 
 - **Comment Golden Snapshots**: TrustBridge enforces golden snapshots for Markdown issue comments (`__tests__/comment.test.ts`) across success and failure paths to prevent formatting regressions during active Waves and release cycles.
-- **Jest Coverage Gate**: Enforces strict statement, branch, function, and line coverage thresholds for `src/horizon.ts` (fetch, retries, caching, RPC fallback) and globally in `jest.config.js`.
+- **Jest Coverage Gate**: Enforced in CI via the dedicated `test-coverage` job running `npm run test:coverage`. Thresholds live in `jest.config.js` — strict statement, branch, function, and line coverage for `src/horizon.ts` (fetch, retries, caching, RPC fallback) and globally.
 
 ### Test Coverage (Wave #39 & #32)
 
@@ -654,10 +655,10 @@ The test suite includes comprehensive fuzz/property tests and reusable workflow 
 
 ### Test Coverage (Wave #38 & #30)
 
-Integration tests for the `comment_mode` dry-run path and dashboard webhook harness:
+Integration tests for the `posting_mode` dry-run path and dashboard webhook harness:
 
-- **Index integration tests** (`__tests__/index.test.ts`): Full jest.mock suite covering `comment_mode` (`post`/`dry-run`/`off`/invalid), dashboard webhook payload content and failure handling, Soroban C-address fast-fail validation, SEP-0007 deep link inclusion, `fail_on_missing` across all modes, and scale output independence.
-- **Workflow sanity tests** (`__tests__/workflow.test.ts`): YAML structure assertions for `ci.yml`, `release.yml`, `dry-run.yml`, and `action.yml` confirming all Wave #30 and #38 inputs are declared and the dry-run smoke jobs are present.
+- **Index integration tests** (`__tests__/index.test.ts`): Full jest.mock suite covering independent `posting_mode` and `comment_mode` resolution, dashboard webhook payload content and failure handling, Soroban C-address fast-fail validation, SEP-0007 deep link inclusion, `fail_on_missing` across all modes, and scale output independence.
+- **Workflow sanity tests** (`__tests__/workflow.test.ts`): YAML structure assertions for `ci.yml`, `release.yml`, and `action.yml` confirming lint/test/build gates and Wave #30/#38 inputs.
 
 Contributing guidelines: [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -683,6 +684,8 @@ Full matrix: [docs/ERROR_HANDLING.md](docs/ERROR_HANDLING.md).
 
 ## Documentation index
 
+Full index: [docs/README.md](docs/README.md)
+
 | Document | Purpose |
 |----------|---------|
 | [README.md](README.md) | Overview, quick start, inputs/outputs (this file) |
@@ -706,3 +709,8 @@ MIT — see [LICENSE](LICENSE).
 ## Acknowledgments
 
 Built for the Stellar open-source ecosystem. Horizon data provided by the [Stellar Development Foundation](https://stellar.org). Wallet setup links reference [Stellar Laboratory](https://laboratory.stellar.org) and [LOBSTR](https://lobstr.co/).
+
+## Handsoff notes
+
+<!-- handsoff-issue-493 -->
+- #493: Align org-defaults composite with root action inputs
