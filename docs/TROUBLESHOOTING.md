@@ -78,44 +78,30 @@ TrustBridge builds its Octokit client from `context.apiUrl` (backed by the runne
 **Helpful links:**
 - [USAGE: GitHub Projects v2 status updates](USAGE.md#github-projects-v2-status-updates-issue-222)
 
-## Local Horizon Reachability Check (`npm run horizon:check`)
+## Preflight permission probe fails (403 / 401)
 
-Operators can run a fast local probe to validate Horizon TLS and reachability matching the action's preflight logic before running workflows.
+Before making any Horizon calls, TrustBridge issues a read-only `GET /repos/{owner}/{repo}/issues/{number}/comments?per_page=1` probe to verify the token has at minimum `issues: read`. A 403 here means the workflow job is missing the required permission block:
 
-### Basic usage
-
-```bash
-HORIZON_URL=https://horizon.stellar.org npm run horizon:check
+```yaml
+permissions:
+  issues: write
+  contents: read
 ```
 
-### Environment variables & options
+A 401 means the token itself is invalid or expired — check that `github_token: ${{ secrets.GITHUB_TOKEN }}` is set correctly.
 
-| Variable / Option | Description |
-|-------------------|-------------|
-| `HORIZON_URL` (or `--url`, `-u`) | The Horizon URL endpoint to probe (required). Sensitive parts and account addresses in URLs are automatically redacted per logger policy. |
-| `HORIZON_TIMEOUT_MS` (or `--timeout`, `-t`) | Probe timeout in milliseconds (default: `5000`). |
-| `--verbose`, `-v` | Enable verbose output. |
-| `--help`, `-h` | Show help message. |
+The preflight probe is **skipped entirely** when `comment_mode` is `dry-run` or `off`, because those modes never post a comment and therefore do not need `issues: write`. Use `comment_mode: dry-run` to validate Horizon checks without requiring write permission.
 
-### Exit codes
+## Using preflight_only to diagnose permission issues
 
-| Code | Meaning |
-|------|---------|
-| `0` | Probe succeeded (HTTP response `< 400`). |
-| `1` | Probe failed (connection failure, timeout, or HTTP response `>= 400`). |
-| `2` | Invalid usage (missing URL or build output not found; run `npm run build` first). |
+Set `preflight_only: true` to run only the permission probe and exit immediately — no Horizon calls are made. This is useful for verifying token permissions in a new repository without spending API quota:
 
-### Examples
-
-```bash
-# Using environment variables
-HORIZON_URL=https://horizon.stellar.org HORIZON_TIMEOUT_MS=3000 npm run horizon:check
-
-# Using command-line arguments
-npm run horizon:check -- --url=https://horizon.stellar.org --timeout=3000 --verbose
-
-# Against local mock Horizon (from mock/horizon/docker-compose.yml)
-HORIZON_URL=http://localhost:8089 npm run horizon:check
+```yaml
+- uses: Stellar-TrustBridge/trustbridge-action@v1
+  with:
+    stellar_address_input: ${{ steps.address.outputs.address }}
+    github_token: ${{ secrets.GITHUB_TOKEN }}
+    preflight_only: true
 ```
 
-The probe uses the same logic as the action's optional Horizon health probe (`horizon_probe: true`), including HEAD/GET fallback and timeout handling.
+The step succeeds when the probe passes (200) and fails with a clear error when the token lacks permission (403/401) or the issue is not found (404).
