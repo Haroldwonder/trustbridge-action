@@ -17,6 +17,12 @@ Every TrustBridge issue comment follows a fixed section order:
 7. **Optional sections** (in order): ledger freshness alert, network-passphrase mismatch, delta section, validation gate, balances, setup cost estimate, Stellar Lab / LOBSTR links, SEP-0007 deep links, SEP-0010 proof, remediation, configuration summary, action outputs reference, hardened metrics, expert diagnostics (debug mode only).
 8. **Footer** — `_Posted by [trustbridge-action](…)_`
 
+### Oversized comments
+
+Comments are kept below a 64,000-byte formatting budget and a 65,536-byte posting limit. If content exceeds the formatting budget, the remediation body is shortened first; the results and onboarding checklist stay ahead of lower-priority optional sections. If the remaining body still exceeds the posting limit, both issue (REST) and discussion (GraphQL) paths use the same UTF-8-safe truncator before calling GitHub.
+
+Every shortened body includes the hidden `trustbridge-action:comment-truncated` metadata marker and ends with the stable `... [Truncated due to GitHub length limits. See workflow logs for full details.]` notice. The truncator prefers a line boundary, never cuts a Unicode surrogate pair, and preserves the TrustBridge footer. In dry-run workflows, formatting still emits the truncation notice and metadata, so the body indicates what would be shortened without making a GitHub API request.
+
 ---
 
 ## Comment threading & posting modes (`comment_mode` & `posting_mode`)
@@ -260,5 +266,3 @@ When the Horizon circuit breaker is open, `CircuitBreaker.execute` fast-fails th
 > - This run fast-failed because the Horizon circuit breaker was open — the account was **not** checked.
 > - This is a resilience safeguard, not a problem with the account. Wait for the recovery window to elapse, then re-run the workflow.
 ```
-
-The banner is rendered by `buildCircuitBreakerBanner` in `src/markdown.ts` and is mutually exclusive with the normal Results bullets: when the breaker is open, the comment does not claim any per-check outcome. This preserves the existing pause semantics — a paused run never reports a false failure.

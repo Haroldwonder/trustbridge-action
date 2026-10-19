@@ -176,6 +176,8 @@ function statusIcon(passed: boolean): string {
 export const MAX_COMMENT_LENGTH = 64000;
 const TRUNCATION_NOTICE =
   "\n\n_... [Truncated due to GitHub length limits. See workflow logs for full details.]_";
+export const COMMENT_TRUNCATED_MARKER =
+  "<!-- trustbridge-action:comment-truncated -->";
 
 export function formatCommentBody(
   result: ValidationResult,
@@ -624,21 +626,40 @@ export function formatCommentBody(
 
   let fullBody = buildWithRemediation(result.remediation);
 
-  if (fullBody.length > MAX_COMMENT_LENGTH && result.remediation) {
-    const excess = fullBody.length - MAX_COMMENT_LENGTH;
-    const availableForRemediation =
-      result.remediation.length - excess - TRUNCATION_NOTICE.length;
+  if (Buffer.byteLength(fullBody, "utf8") > MAX_COMMENT_LENGTH) {
+    const suffix = `\n\n${COMMENT_TRUNCATED_MARKER}${TRUNCATION_NOTICE}`;
+    const bodyBudget =
+      MAX_COMMENT_LENGTH - Buffer.byteLength(suffix, "utf8");
+    const bodyWithoutRemediation = buildWithRemediation(undefined);
 
-    let truncatedRemediation: string;
-    if (availableForRemediation > 0) {
-      truncatedRemediation =
-        result.remediation.slice(0, availableForRemediation) +
-        TRUNCATION_NOTICE;
-    } else {
-      truncatedRemediation = TRUNCATION_NOTICE.trimStart();
+    let prioritizedBody = bodyWithoutRemediation;
+    if (result.remediation) {
+      const bodyWithPlaceholder = buildWithRemediation("x");
+      const fixedRemediationBytes =
+        Buffer.byteLength(bodyWithPlaceholder, "utf8") -
+        Buffer.byteLength(bodyWithoutRemediation, "utf8") -
+        1;
+      const remediationBudget =
+        bodyBudget -
+        Buffer.byteLength(bodyWithoutRemediation, "utf8") -
+        fixedRemediationBytes;
+      const remediationPrefix = takeUtf8Prefix(
+        result.remediation,
+        Math.max(0, remediationBudget),
+      );
+      prioritizedBody = buildWithRemediation(
+        remediationPrefix || undefined,
+      );
     }
 
-    fullBody = buildWithRemediation(truncatedRemediation);
+    fullBody = takeUtf8PrefixAtLineBoundary(
+      prioritizedBody,
+      Math.max(0, bodyBudget),
+    );
+    fullBody += suffix;
+    core.info(
+      "Comment body exceeded the safe length limit; oversized remediation was shortened to preserve core checklist sections.",
+    );
   }
 
   return fullBody;
@@ -715,13 +736,35 @@ export const COMMENT_SIZE_LIMIT_BYTES = 65536;
  */
 export const COMMENT_TRUNCATION_NOTICE_BYTES = 512;
 
+function takeUtf8Prefix(text: string, byteLimit: number): string {
+  let prefix = "";
+  let bytesUsed = 0;
+  for (const character of text) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytesUsed + characterBytes > byteLimit) break;
+    prefix += character;
+    bytesUsed += characterBytes;
+  }
+  return prefix;
+}
+
+function takeUtf8PrefixAtLineBoundary(
+  text: string,
+  byteLimit: number,
+): string {
+  const prefix = takeUtf8Prefix(text, byteLimit);
+  if (prefix.length === text.length) return prefix;
+
+  const lastLineBreak = prefix.lastIndexOf("\n");
+  return lastLineBreak >= 0 ? prefix.slice(0, lastLineBreak + 1) : prefix;
+}
+
 /**
  * Build a truncated comment body that fits within the given size limit.
  *
- * The full body is cut at a safe byte offset, a truncation notice is
- * appended, and the TrustBridge footer is preserved so the sticky-comment
- * marker remains present.  The cut always happens on a line boundary so the
- * resulting markdown is clean.
+ * The body is shortened on a Unicode code-point boundary, then the footer,
+ * truncation metadata, and stable notice are appended. A line boundary is
+ * preferred when one fits within the budget.
  *
  * @param fullBody  The full comment body produced by `formatCommentBody`.
  * @param reportPath  Workspace-relative path where the full report was written.
@@ -736,17 +779,6 @@ export function buildTruncatedCommentBody(
   reportPath: string,
   sizeLimit: number = COMMENT_SIZE_LIMIT_BYTES,
 ): string {
-  const budget = sizeLimit - COMMENT_TRUNCATION_NOTICE_BYTES;
-
-  // Walk backwards from the budget boundary to find a clean line break.
-  const bodyBytes = Buffer.from(fullBody, "utf8");
-  let cutByte = budget;
-  while (cutByte > 0 && bodyBytes[cutByte] !== 0x0a /* '\n' */) {
-    cutByte--;
-  }
-
-  const truncated = bodyBytes.subarray(0, cutByte).toString("utf8");
-
   const notice = [
     "",
     "---",
@@ -757,9 +789,32 @@ export function buildTruncatedCommentBody(
     "",
     "---",
     TRUSTBRIDGE_FOOTER,
+    COMMENT_TRUNCATED_MARKER,
+    TRUNCATION_NOTICE,
   ].join("\n");
 
+  const noticeBytes = Buffer.byteLength(notice, "utf8");
+  const budget =
+    sizeLimit - Math.max(COMMENT_TRUNCATION_NOTICE_BYTES, noticeBytes);
+  if (budget < 0) {
+    throw new RangeError(
+      `Comment size limit (${sizeLimit} bytes) is too small for the truncation notice (${noticeBytes} bytes).`,
+    );
+  }
+
+  const truncated = takeUtf8PrefixAtLineBoundary(fullBody, budget);
   return truncated + notice;
+}
+
+function fitCommentBodyToLimit(body: string): string {
+  if (Buffer.byteLength(body, "utf8") <= COMMENT_SIZE_LIMIT_BYTES) {
+    return body;
+  }
+
+  core.info(
+    "Comment body exceeds GitHub's size limit; truncating it before posting.",
+  );
+  return buildTruncatedCommentBody(body, "trustbridge-report.md");
 }
 
 /**
@@ -1308,25 +1363,8 @@ export async function postIssueComment(
   body: string,
   options: UpsertCommentOptions = {},
 ): Promise<string | undefined> {
-  const posted = await upsertIssueComment(token, body, options);
-  return posted?.url;
-}
+  body = fitCommentBodyToLimit(body);
 
-/**
- * Post or update the TrustBridge issue comment (Issue #696).
- *
- * Returns both the comment URL and its numeric REST id, taken from the
- * `createComment` / `updateComment` response that actually wrote the body.
- * When `updateComment` fails after a successful sticky lookup the run falls
- * back to `createComment`, so the id of the stale comment is never returned.
- *
- * @returns `undefined` when there is no issue or pull-request context.
- */
-export async function upsertIssueComment(
-  token: string,
-  body: string,
-  options: UpsertCommentOptions = {},
-): Promise<PostedIssueComment | undefined> {
   // Resolve effective comment mode (#322): commentMode input takes precedence
   // over legacy sticky boolean.
   const effectiveMode = resolveCommentMode(
@@ -1749,6 +1787,8 @@ export async function postDiscussionComment(
   body: string,
   options: UpsertDiscussionCommentOptions = {},
 ): Promise<string | undefined> {
+  body = fitCommentBodyToLimit(body);
+
   const sticky = resolveCommentMode(options.commentMode, options.sticky) === 'sticky';
   const forceComment = options.forceComment ?? false;
   const snoozeWindowMs = options.snoozeWindowMs ?? 0;
