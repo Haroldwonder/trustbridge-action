@@ -123,12 +123,14 @@ Full input semantics and output reference: [docs/USAGE.md](docs/USAGE.md).
 | `trustline_exists` | boolean (string) | `true` if the configured asset trustline exists |
 | `xlm_balance` | string | Native XLM balance from Horizon (or `0` / `unknown`) |
 | `account_funded` | boolean (string) | `true` if Horizon returned an active account |
+| `ready` | boolean (string) | `true` when all validation checks passed |
 | `asset_balance` | string | Current configured asset (e.g. USDC) balance as reported by Horizon, or `0` / `unknown` |
-| `asset_balance_met` | boolean (string) | `true` when `min_asset_balance` is not set or the balance meets or exceeds the floor, otherwise `false` |
 | `comment_url` | string | URL to the created issue comment when run in issue context |
-| `check_account_funded` | boolean (string) | Named per-check output — mirrors `account_funded` |
-| `check_trustline` | boolean (string) | Named per-check output — mirrors `trustline_exists` |
-| `check_xlm_reserve` | boolean (string) | Named per-check output — `true` if native XLM ≥ `min_xlm_reserve` |
+| `reason_code` | string | Machine-readable validation outcome such as `SUCCESS` or `ACCOUNT_NOT_FUNDED` |
+| `validated_at` | string | ISO-8601 timestamp when validation checks were performed |
+| `horizon_url` | string | Horizon API base URL used for validation |
+
+The complete output contract, including audit, timing, and batch-mode outputs, is declared in [`action.yml`](action.yml). Batch-only output values are empty on single-address runs.
 
 Use outputs in downstream steps:
 
