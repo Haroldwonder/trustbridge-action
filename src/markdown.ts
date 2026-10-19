@@ -92,81 +92,91 @@ export function buildAssetTrustlineTable(
 }
 
 /**
- * A single failed check contributing to a multi-check failure summary
- * (Issue #761).
+ * A single per-asset checklist entry for {@link buildAssetChecklist}
+ * (Issue #717).
  *
- * Mirrors the shape of a `ValidationResult` failure so callers can pass the
- * failing checks straight through without reshaping them. `category` is a
- * short, stable label (e.g. `multi-asset`, `clawback`, `unauthorized`) used
- * to group failures in the rendered summary.
+ * Extends {@link AssetTrustlineRow} with the optional per-asset hints that
+ * the `assets_json` validation surfaces (clawback-enabled assets and
+ * unauthorized trustlines).
  */
-export interface FailureSummaryEntry {
-  /** Short stable category label, e.g. `multi-asset`, `clawback`, `unauthorized`. */
-  category: string;
-  /** Human-readable check name, e.g. `USDC trustline`. */
-  check: string;
-  /** Actionable remediation message for the assignee. */
-  message: string;
+export interface AssetChecklistRow extends AssetTrustlineRow {
+  /** Whether the asset issuer has clawback enabled. */
+  clawbackEnabled?: boolean;
+  /** Whether the trustline exists but is not authorized by the issuer. */
+  trustlineAuthorized?: boolean;
+  /** Optional deep link (e.g. stellar.expert) for the asset. */
+  deepLink?: string;
 }
 
 /**
- * Render a consolidated multi-check failure summary (Issue #761).
+ * Render a per-asset checklist for the `assets_json` input (Issue #717).
  *
- * When several checks fail at once — the common Wave case of multi-asset
- * trustlines plus a clawback-enabled asset plus an unauthorized issuer —
- * posting one comment per failure is noisy and makes remediation ambiguous.
- * This helper renders a single `###` section that groups failures by
- * category, so the assignee sees every blocker and its fix in one place.
+ * Each asset becomes its own task-list line so assignees managing portfolios
+ * can scan pass/fail state per asset instead of reading aggregate prose. The
+ * ordering of `rows` is preserved verbatim (stable ordering) and duplicate
+ * `assetCode`/`assetIssuer` pairs are deduped so a repeated entry never
+ * produces a duplicate row.
  *
- * All dynamic values are escaped through `escapeMarkdownInline` so a check
- * name or message can never inject Markdown structure. When `entries` is
- * empty the function returns `''` so callers can skip the section entirely
- * (no empty headings in comments).
+ * The layout follows the existing markdown conventions used elsewhere in
+ * this module: a `###` heading, `- [x]`/`- [ ]` task items, `inlineCode` for
+ * asset codes and issuers, and `escapeMarkdownInline` for free-form text.
  *
- * @param entries Failed checks to summarize.
- * @param options.heading Section heading (defaults to "Failure summary").
- * @returns Markdown section (heading + grouped list), or `''` when empty.
+ * @param rows Per-asset results. When empty, returns `''` so callers can
+ *             skip the section entirely (no empty headings in comments).
+ * @param options.heading Section heading (defaults to "Asset checklist").
+ * @returns Markdown section (heading + checklist), or `''` when `rows` is empty.
  */
-export function buildFailureSummary(
-  entries: FailureSummaryEntry[],
+export function buildAssetChecklist(
+  rows: AssetChecklistRow[],
   options: { heading?: string } = {},
 ): string {
-  if (!Array.isArray(entries) || entries.length === 0) {
+  if (!Array.isArray(rows) || rows.length === 0) {
     return '';
   }
 
-  const heading = options.heading ?? 'Failure summary';
+  const heading = options.heading ?? 'Asset checklist';
 
-  // Group by category while preserving first-seen order for stable output.
-  const groups = new Map<string, FailureSummaryEntry[]>();
-  for (const entry of entries) {
-    const category = entry.category || 'other';
-    const bucket = groups.get(category);
-    if (bucket) {
-      bucket.push(entry);
-    } else {
-      groups.set(category, [entry]);
+  const shortenIssuer = (issuer: string): string => {
+    if (issuer.length <= 12) return issuer;
+    return `${issuer.slice(0, 4)}…${issuer.slice(-4)}`;
+  };
+
+  const seen = new Set<string>();
+  const lines: string[] = [`### ${escapeMarkdownInline(heading)}`, ''];
+
+  for (const row of rows) {
+    const dedupeKey = `${row.assetCode}\u0000${row.assetIssuer}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    const passed = row.trustlineExists && row.trustlineAuthorized !== false;
+    const icon = passed ? '✅' : '❌';
+    const box = passed ? '[x]' : '[ ]';
+    const asset = inlineCode(row.assetCode);
+    const issuer = inlineCode(shortenIssuer(row.assetIssuer));
+    const trustline = row.trustlineExists
+      ? row.trustlineAuthorized === false
+        ? 'trustline unauthorized'
+        : 'trustline exists'
+      : 'trustline missing';
+
+    const hints: string[] = [];
+    if (row.clawbackEnabled) hints.push('clawback enabled');
+    if (row.trustlineExists && row.trustlineAuthorized === false) {
+      hints.push('unauthorized trustline');
     }
+
+    let line = `- ${box} ${icon} ${asset} — issuer ${issuer} — ${trustline}`;
+    if (hints.length > 0) {
+      line += ` (${hints.map((hint) => escapeMarkdownInline(hint)).join(', ')})`;
+    }
+    if (!passed && row.deepLink) {
+      line += ` — [remediation](${row.deepLink})`;
+    }
+    lines.push(line);
   }
 
-  const lines: string[] = [
-    `### ${escapeMarkdownInline(heading)}`,
-    '',
-    `${entries.length} check${entries.length === 1 ? '' : 's'} failed:`,
-    '',
-  ];
-
-  for (const [category, bucket] of groups) {
-    lines.push(`**${escapeMarkdownInline(category)}**`);
-    for (const entry of bucket) {
-      lines.push(
-        `- ${escapeMarkdownInline(entry.check)}: ${escapeMarkdownInline(entry.message)}`,
-      );
-    }
-    lines.push('');
-  }
-
-  return lines.join('\n').trimEnd();
+  return lines.join('\n');
 }
 
 

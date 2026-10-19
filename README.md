@@ -797,5 +797,5 @@ Built for the Stellar open-source ecosystem. Horizon data provided by the [Stell
 <!-- handsoff-issue-493 -->
 - #493: Align org-defaults composite with root action inputs
 
-<!-- handsoff-issue-733 -->
-- #733: Integration test update vs create comment when comment_id provided
+<!-- handsoff-issue-718 -->
+- #718: Align i18n locale packs for clawback and unauthorized trustlines
